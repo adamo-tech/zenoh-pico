@@ -6,13 +6,13 @@
 <style>
 body { margin: 0; padding: 1rem; color: #eee; background: #181818; font: 14px system-ui; }
 h2 { margin: 0 0 .7rem; }
-canvas, img { display: block; width: 160px; height: 120px; max-width: 100%; border: 1px solid #555; background: #000; image-rendering: auto; }
+canvas, img { display: block; width: 320px; height: 240px; max-width: 100%; border: 1px solid #555; background: #000; image-rendering: auto; }
 [hidden] { display: none; }
 #stats { margin-top: .7rem; color: #8fda8f; white-space: pre-wrap; }
 </style>
 <h2 id="heading"></h2>
-<canvas id="source" width="160" height="120" hidden></canvas>
-<img id="received" width="160" height="120" alt="Waiting for the first Zenoh frame" hidden>
+<canvas id="source" width="320" height="240" hidden></canvas>
+<img id="received" width="320" height="240" alt="Waiting for the first Zenoh frame" hidden>
 <div id="stats">Loading WASM…</div>
 <script>
 const params = new URLSearchParams(location.search);
@@ -57,16 +57,16 @@ function drawFrame(index) {
   const t = index / 15;
   const hue = (index * 3) % 360;
   ctx.fillStyle = `hsl(${hue} 65% 28%)`;
-  ctx.fillRect(0, 0, 160, 120);
-  for (let x = -30; x < 190; x += 28) {
+  ctx.fillRect(0, 0, 320, 240);
+  for (let x = -60; x < 380; x += 55) {
     ctx.fillStyle = `hsl(${(hue + x) % 360} 80% 55%)`;
-    ctx.fillRect((x + index * 2) % 190 - 30, 24, 17, 62);
+    ctx.fillRect((x + index * 4) % 380 - 60, 45, 34, 125);
   }
   ctx.fillStyle = '#fff';
-  ctx.font = 'bold 14px system-ui';
-  ctx.fillText('Zenoh-Pico WASM', 19, 103);
-  ctx.font = '9px monospace';
-  ctx.fillText(`frame ${index}  ${t.toFixed(1)}s`, 29, 16);
+  ctx.font = 'bold 28px system-ui';
+  ctx.fillText('Zenoh-Pico WASM', 38, 205);
+  ctx.font = '18px monospace';
+  ctx.fillText(`frame ${index}  ${t.toFixed(1)}s`, 58, 32);
 }
 async function sendFrame() {
   if (!polling) return;
