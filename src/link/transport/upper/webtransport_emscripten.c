@@ -10,6 +10,8 @@
 #include "zenoh-pico/link/transport/webtransport.h"
 #include "zenoh-pico/utils/pointers.h"
 
+static bool _zp_webtransport_nonblocking = false;
+
 EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms), {
     if (typeof WebTransport === 'undefined') return -1;
     if (!globalThis.__zenohPicoWebTransport) {
@@ -83,6 +85,34 @@ EM_ASYNC_JS(int, _zp_webtransport_js_read, (int handle, uint8_t *dst, size_t len
     return copied;
 });
 
+EM_JS(int, _zp_webtransport_js_read_nonblocking, (int handle, uint8_t *dst, size_t len), {
+    const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
+    if (!link) return -1;
+    if (link.incomingBytes === 0) return link.closed ? -1 : 0;
+    const wanted = Math.min(len, link.incomingBytes);
+    let copied = 0;
+    while (copied < wanted) {
+        const chunk = link.incoming[0];
+        const available = chunk.length - link.incomingOffset;
+        const count = Math.min(wanted - copied, available);
+        HEAPU8.set(chunk.subarray(link.incomingOffset, link.incomingOffset + count), dst + copied);
+        copied += count;
+        link.incomingOffset += count;
+        link.incomingBytes -= count;
+        if (link.incomingOffset === chunk.length) {
+            link.incoming.shift();
+            link.incomingOffset = 0;
+        }
+    }
+    return copied;
+});
+
+EM_JS(int, _zp_webtransport_js_available, (int handle), {
+    const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
+    if (!link) return -1;
+    return link.incomingBytes;
+});
+
 EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, size_t len), {
     const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
     if (!link) return -1;
@@ -134,6 +164,7 @@ EM_JS(void, _zp_webtransport_js_set_nonblocking, (int enabled), {
 
 EMSCRIPTEN_KEEPALIVE
 void _z_webtransport_transport_set_nonblocking(bool enabled) {
+    _zp_webtransport_nonblocking = enabled;
     _zp_webtransport_js_set_nonblocking(enabled ? 1 : 0);
 }
 
@@ -178,7 +209,9 @@ void _z_webtransport_transport_close(_z_webtransport_socket_t *sock) {
 }
 
 static size_t _z_webtransport_read(_z_sys_net_socket_t sock, uint8_t *ptr, size_t len) {
-    int result = _zp_webtransport_js_read(sock._webtransport._handle, ptr, len, sock._webtransport._tout);
+    int result = _zp_webtransport_nonblocking
+                     ? _zp_webtransport_js_read_nonblocking(sock._webtransport._handle, ptr, len)
+                     : _zp_webtransport_js_read(sock._webtransport._handle, ptr, len, sock._webtransport._tout);
     return result < 0 ? SIZE_MAX : (size_t)result;
 }
 
@@ -188,6 +221,12 @@ size_t _z_webtransport_transport_read(const _z_webtransport_socket_t *sock, uint
 }
 
 size_t _z_webtransport_transport_read_exact(const _z_webtransport_socket_t *sock, uint8_t *ptr, size_t len) {
+    if (_zp_webtransport_nonblocking) {
+        int available = _zp_webtransport_js_available(sock->_sock._webtransport._handle);
+        if (available < 0) return SIZE_MAX;
+        if ((size_t)available < len) return 0;
+        return _z_webtransport_read(sock->_sock, ptr, len);
+    }
     size_t total = 0;
     while (total < len) {
         size_t count = _z_webtransport_read(sock->_sock, _z_ptr_u8_offset(ptr, total), len - total);

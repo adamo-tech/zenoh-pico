@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zenoh-Pico video node</title>
+<style>
+body { margin: 0; padding: 1rem; color: #eee; background: #181818; font: 14px system-ui; }
+h2 { margin: 0 0 .7rem; }
+canvas, img { display: block; width: 160px; height: 120px; max-width: 100%; border: 1px solid #555; background: #000; image-rendering: auto; }
+[hidden] { display: none; }
+#stats { margin-top: .7rem; color: #8fda8f; white-space: pre-wrap; }
+</style>
+<h2 id="heading"></h2>
+<canvas id="source" width="160" height="120" hidden></canvas>
+<img id="received" width="160" height="120" alt="Waiting for the first Zenoh frame" hidden>
+<div id="stats">Loading WASM…</div>
+<script>
+const params = new URLSearchParams(location.search);
+const role = params.get('role') || 'receiver';
+const keyexpr = 'demo/pico/video';
+const certHash = 'nYssBVdaYdbVnmBjLeFKA2ZCroIMlXzn3CTN6kmRUP0=';
+const heading = document.querySelector('#heading');
+const stats = document.querySelector('#stats');
+const canvas = document.querySelector('#source');
+const image = document.querySelector('#received');
+heading.textContent = role === 'sender' ? 'Sender — generated test video' : 'Receiver — Zenoh-delivered video';
+(role === 'sender' ? canvas : image).hidden = false;
+
+let wasmQueue = Promise.resolve();
+let polling = false;
+let frames = 0;
+let bytes = 0;
+let lastRateTime = performance.now();
+let lastRateFrames = 0;
+let lastObjectUrl = null;
+function runWasm(name, returnType, argTypes = [], args = []) {
+  const operation = wasmQueue.then(() => Module.ccall(name, returnType, argTypes, args, {async: true}));
+  wasmQueue = operation.catch(() => {});
+  return operation;
+}
+function updateStats(prefix) {
+  const now = performance.now();
+  if (now - lastRateTime >= 1000) {
+    const fps = (frames - lastRateFrames) * 1000 / (now - lastRateTime);
+    stats.textContent = `${prefix}\n${fps.toFixed(1)} fps · ${frames} frames · ${(bytes / 1024).toFixed(0)} KiB`;
+    lastRateTime = now;
+    lastRateFrames = frames;
+  }
+}
+async function poll() {
+  if (!polling) return;
+  await runWasm('zenoh_pico_browser_poll', 'number');
+  setTimeout(poll, 0);
+}
+function drawFrame(index) {
+  const ctx = canvas.getContext('2d');
+  const t = index / 15;
+  const hue = (index * 3) % 360;
+  ctx.fillStyle = `hsl(${hue} 65% 28%)`;
+  ctx.fillRect(0, 0, 160, 120);
+  for (let x = -30; x < 190; x += 28) {
+    ctx.fillStyle = `hsl(${(hue + x) % 360} 80% 55%)`;
+    ctx.fillRect((x + index * 2) % 190 - 30, 24, 17, 62);
+  }
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 14px system-ui';
+  ctx.fillText('Zenoh-Pico WASM', 19, 103);
+  ctx.font = '9px monospace';
+  ctx.fillText(`frame ${index}  ${t.toFixed(1)}s`, 29, 16);
+}
+async function sendFrame() {
+  if (!polling) return;
+  drawFrame(frames);
+  let ptr = 0;
+  try {
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.82));
+    const data = new Uint8Array(await blob.arrayBuffer());
+    ptr = Module._malloc(data.length);
+    HEAPU8.set(data, ptr);
+    const result = await runWasm('zenoh_pico_browser_put_binary', 'number',
+      ['string', 'number', 'number'], [keyexpr, ptr, data.length]);
+    if (result < 0) throw new Error(`put failed: ${result}`);
+    frames++; bytes += data.length;
+    updateStats(`Publishing on ${keyexpr}`);
+  } catch (error) {
+    stats.textContent = String(error);
+    polling = false;
+  } finally {
+    if (ptr) Module._free(ptr);
+  }
+}
+var Module = {
+  zenohPicoServerCertificateHash: certHash,
+  print: message => console.log(message),
+  printErr: message => { stats.textContent = `ERROR: ${message}`; },
+  onZenohVideoFrame(data) {
+    const url = URL.createObjectURL(new Blob([data], {type: 'image/jpeg'}));
+    image.onload = () => { if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl); lastObjectUrl = url; };
+    image.src = url;
+    frames++; bytes += data.length;
+    updateStats(`Subscribed to ${keyexpr}`);
+  },
+  async onRuntimeInitialized() {
+    stats.textContent = 'Connecting…';
+    const opened = await runWasm('zenoh_pico_browser_open', 'number', ['string'],
+      ['webtransport/127.0.0.1:7448#tout=10000']);
+    if (opened < 0) { stats.textContent = `Connection failed: ${opened}`; return; }
+    if (role === 'receiver') {
+      const subscribed = await runWasm('zenoh_pico_browser_subscribe_video', 'number', ['string'], [keyexpr]);
+      if (subscribed < 0) { stats.textContent = `Subscribe failed: ${subscribed}`; return; }
+      stats.textContent = `Subscribed to ${keyexpr}\nWaiting for frames…`;
+    } else {
+      stats.textContent = `Publishing on ${keyexpr}\nStarting at 15 fps…`;
+      // Allow the receiver's subscription declaration to reach the router
+      // before best-effort video publication begins.
+      setTimeout(() => setInterval(sendFrame, 1000 / 15), 2000);
+    }
+    polling = true;
+    poll();
+  },
+};
+</script>
+<script src="zenoh-pico-browser.js"></script>
+</html>

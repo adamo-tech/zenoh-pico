@@ -36,7 +36,8 @@ emcmake cmake -S "$repo_dir" -B "$repo_dir/build-wasm" \
   -DZ_FEATURE_LINK_TCP=0 \
   -DZ_FEATURE_LINK_UDP_MULTICAST=0 \
   -DZ_FEATURE_LINK_UDP_UNICAST=0 \
-  -DZ_FEATURE_SCOUTING=0
+  -DZ_FEATURE_SCOUTING=0 \
+  -DFRAG_MAX_SIZE=65536
 
 cmake --build "$repo_dir/build-wasm" --parallel
 mkdir -p "$repo_dir/dist-wasm"
@@ -63,7 +64,9 @@ emcc "$repo_dir/wasm/browser.c" \
   -I"$repo_dir/include" -I"$repo_dir/build-wasm/include" \
   -DZENOH_EMSCRIPTEN -DZENOH_COMPILER_CLANG -DZENOH_C_STANDARD=11 -O3 \
   -sALLOW_MEMORY_GROWTH=1 -sASYNCIFY=1 \
-  -sEXPORTED_FUNCTIONS=_main,_zenoh_pico_browser_open,_zenoh_pico_browser_put,_zenoh_pico_browser_put_batch,_zenoh_pico_browser_poll,_zenoh_pico_browser_close \
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_zenoh_pico_browser_open,_zenoh_pico_browser_put,_zenoh_pico_browser_put_binary,_zenoh_pico_browser_put_batch,_zenoh_pico_browser_subscribe_video,_zenoh_pico_browser_poll,_zenoh_pico_browser_close \
   -sEXPORTED_RUNTIME_METHODS=ccall \
   -o "$repo_dir/dist-wasm/browser/zenoh-pico-browser.js"
 cp "$repo_dir/wasm/browser/index.html" "$repo_dir/dist-wasm/browser/index.html"
+cp "$repo_dir/wasm/browser/video.html" "$repo_dir/dist-wasm/browser/video.html"
+cp "$repo_dir/wasm/browser/video-node.html" "$repo_dir/dist-wasm/browser/video-node.html"

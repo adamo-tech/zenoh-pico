@@ -286,7 +286,7 @@ EMSCRIPTEN_FORCE_COMPILERS:BOOL=ON
 EMSCRIPTEN_GENERATE_BITCODE_STATIC_LIBRARIES:BOOL=OFF
 
 //Use this to override the maximum size for fragmented messages
-FRAG_MAX_SIZE:STRING=4096
+FRAG_MAX_SIZE:STRING=65536
 
 //Use option on Linux to produce Debian and RPM packages.
 PACKAGING:BOOL=OFF
