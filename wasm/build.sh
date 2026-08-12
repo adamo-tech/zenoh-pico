@@ -30,6 +30,7 @@ emcmake cmake -S "$repo_dir" -B "$repo_dir/build-wasm" \
   -DZ_FEATURE_UNICAST_TRANSPORT=1 \
   -DZ_FEATURE_LOCAL_SUBSCRIBER=1 \
   -DZ_FEATURE_LOCAL_QUERYABLE=1 \
+  -DZ_FEATURE_MULTI_THREAD=0 \
   -DZ_FEATURE_LINK_WS=1 \
   -DZ_FEATURE_LINK_WEBTRANSPORT=1 \
   -DZ_FEATURE_LINK_TCP=0 \
@@ -55,3 +56,14 @@ emcc "$repo_dir/wasm/smoke.c" \
   -o "$repo_dir/dist-wasm/zenoh-pico.js"
 
 "$EMSDK_NODE" "$repo_dir/dist-wasm/zenoh-pico.js"
+
+mkdir -p "$repo_dir/dist-wasm/browser"
+emcc "$repo_dir/wasm/browser.c" \
+  -Wl,--whole-archive "$repo_dir/build-wasm/lib/libzenohpico.a" -Wl,--no-whole-archive \
+  -I"$repo_dir/include" -I"$repo_dir/build-wasm/include" \
+  -DZENOH_EMSCRIPTEN -DZENOH_COMPILER_CLANG -DZENOH_C_STANDARD=11 -O3 \
+  -sALLOW_MEMORY_GROWTH=1 -sASYNCIFY=1 \
+  -sEXPORTED_FUNCTIONS=_main,_zenoh_pico_browser_open,_zenoh_pico_browser_put,_zenoh_pico_browser_put_batch,_zenoh_pico_browser_poll,_zenoh_pico_browser_close \
+  -sEXPORTED_RUNTIME_METHODS=ccall \
+  -o "$repo_dir/dist-wasm/browser/zenoh-pico-browser.js"
+cp "$repo_dir/wasm/browser/index.html" "$repo_dir/dist-wasm/browser/index.html"

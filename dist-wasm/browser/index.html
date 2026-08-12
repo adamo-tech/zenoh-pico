@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zenoh-Pico WebTransport</title>
+<style>
+body { font: 16px system-ui; max-width: 48rem; margin: 3rem auto; padding: 0 1rem; }
+label { display: block; margin: 1rem 0; }
+input { box-sizing: border-box; width: 100%; padding: .6rem; }
+button { padding: .65rem 1rem; margin-right: .5rem; }
+pre { padding: 1rem; background: #111; color: #9f9; min-height: 5rem; white-space: pre-wrap; }
+</style>
+<h1>Zenoh-Pico over WebTransport</h1>
+<label>Zenoh locator <input id="endpoint" value="webtransport/127.0.0.1:7448#tout=10000"></label>
+<label>SHA-256 certificate hash (base64) <input id="certHash" value="nYssBVdaYdbVnmBjLeFKA2ZCroIMlXzn3CTN6kmRUP0="></label>
+<button id="connect">Connect</button>
+<label>Key expression <input id="key" value="demo/pico/browser"></label>
+<label>Value <input id="value" value="Hello from Zenoh-Pico WASM"></label>
+<button id="put" disabled>Put</button><button id="close" disabled>Close</button>
+<label>Benchmark message count <input id="benchmarkCount" type="number" min="1" value="1000"></label>
+<button id="benchmark" disabled>Benchmark batched puts</button>
+<pre id="status">Loading WebAssembly…</pre>
+<script>
+const status = document.querySelector('#status');
+let polling = false;
+let wasmQueue = Promise.resolve();
+function runWasm(name, returnType, argTypes = [], args = []) {
+  const operation = wasmQueue.then(() => Module.ccall(name, returnType, argTypes, args, {async: true}));
+  wasmQueue = operation.catch(() => {});
+  return operation;
+}
+async function pollSession() {
+  if (!polling) return;
+  try {
+    await runWasm('zenoh_pico_browser_poll', 'number');
+  } catch (error) {
+    log(`Session polling failed: ${error}`);
+    polling = false;
+    return;
+  }
+  setTimeout(pollSession, 0);
+}
+const log = message => status.textContent += `\n${message}`;
+var Module = {
+  print: log,
+  printErr: message => log(`ERROR: ${message}`),
+  onRuntimeInitialized() {
+    status.textContent = 'Zenoh-Pico WASM ready.';
+    if (new URLSearchParams(location.search).has('autorun')) setTimeout(() => connect.click(), 0);
+  },
+};
+</script>
+<script src="zenoh-pico-browser.js"></script>
+<script>
+connect.onclick = async () => {
+  try {
+    Module.zenohPicoServerCertificateHash = certHash.value.trim();
+    log(`Connecting to ${endpoint.value}…`);
+    const result = await runWasm('zenoh_pico_browser_open', 'number', ['string'], [endpoint.value]);
+    if (result < 0) throw new Error(`z_open returned ${result}`);
+    log('Connected: native Zenoh session is open.');
+    polling = true;
+    pollSession();
+    put.disabled = false; benchmark.disabled = false; close.disabled = false; connect.disabled = true;
+    const autotest = Number(new URLSearchParams(location.search).get('autotest'));
+    if (autotest > 0) {
+      benchmarkCount.value = autotest;
+      await runBenchmark();
+    }
+  } catch (error) { log(`Connection failed: ${error}`); }
+};
+put.onclick = async () => {
+  put.disabled = true;
+  try {
+    const result = await runWasm('zenoh_pico_browser_put', 'number', ['string', 'string'], [key.value, value.value]);
+    log(result < 0 ? `Put failed: ${result}` : `Put sent on ${key.value}`);
+  } finally {
+    if (polling) put.disabled = false;
+  }
+};
+async function runBenchmark() {
+  const count = Math.max(1, Number(benchmarkCount.value) || 1);
+  benchmark.disabled = true;
+  const started = performance.now();
+  try {
+    const sent = await runWasm('zenoh_pico_browser_put_batch', 'number', ['string', 'string', 'number'],
+      [key.value, value.value, count]);
+    const elapsed = performance.now() - started;
+    if (sent < 0) log(`Benchmark failed: ${sent}`);
+    else log(`Benchmark queued ${sent} puts in ${elapsed.toFixed(1)} ms (${(sent * 1000 / elapsed).toFixed(0)} puts/s).`);
+  } finally {
+    if (polling) benchmark.disabled = false;
+  }
+}
+benchmark.onclick = runBenchmark;
+close.onclick = async () => {
+  polling = false;
+  await runWasm('zenoh_pico_browser_close', null);
+  log('Session closed.'); put.disabled = true; benchmark.disabled = true; close.disabled = true; connect.disabled = false;
+};
+</script>
+</html>

@@ -20,18 +20,36 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
     const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('WebTransport open timeout')), timeout_ms));
     try {
-        const transport = new WebTransport(endpoint);
+        const options = {};
+        const hashBase64 = Module.zenohPicoServerCertificateHash;
+        if (hashBase64) {
+            const raw = atob(hashBase64);
+            options.serverCertificateHashes = [{
+                algorithm: 'sha-256',
+                value: Uint8Array.from(raw, c => c.charCodeAt(0)),
+            }];
+        }
+        const transport = new WebTransport(endpoint, options);
         await Promise.race([transport.ready, timeout]);
-        const stream = await Promise.race([transport.createBidirectionalStream(), timeout]);
         const handle = registry.next++;
         registry.links.set(handle, {
             transport,
-            reader: stream.readable.getReader(),
-            writer: stream.writable.getWriter(),
-            pending: new Uint8Array(0),
+            streamPromise: transport.createBidirectionalStream(),
+            reader: null,
+            writer: null,
+            incoming: [],
+            incomingOffset: 0,
+            incomingBytes: 0,
+            closed: false,
+            writeError: false,
+            readPump: null,
+            dataSignal: null,
+            dataSignalResolve: null,
+            nonblocking: false,
         });
         return handle;
-    } catch (_) {
+    } catch (error) {
+        if (Module.printErr) Module.printErr('WebTransport open failed: ' + String(error));
         return -1;
     }
 });
@@ -39,41 +57,92 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
 EM_ASYNC_JS(int, _zp_webtransport_js_read, (int handle, uint8_t *dst, size_t len, uint32_t timeout_ms), {
     const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
     if (!link) return -1;
-    try {
-        if (link.pending.length === 0) {
-            const timeout = new Promise(resolve => setTimeout(() => resolve(null), timeout_ms));
-            const result = await Promise.race([link.reader.read(), timeout]);
-            if (result === null) return 0;
-            if (result.done) return -1;
-            link.pending = result.value;
+    if (link.incomingBytes === 0 && !link.closed && !link.nonblocking) {
+        if (!link.dataSignal) {
+            link.dataSignal = new Promise(resolve => { link.dataSignalResolve = resolve; });
         }
-        const count = Math.min(len, link.pending.length);
-        HEAPU8.set(link.pending.subarray(0, count), dst);
-        link.pending = link.pending.subarray(count);
-        return count;
-    } catch (_) {
-        return -1;
+        const timeout = new Promise(resolve => setTimeout(resolve, timeout_ms));
+        await Promise.race([link.dataSignal, timeout]);
     }
+    if (link.incomingBytes === 0) return link.closed ? -1 : 0;
+    const wanted = Math.min(len, link.incomingBytes);
+    let copied = 0;
+    while (copied < wanted) {
+        const chunk = link.incoming[0];
+        const available = chunk.length - link.incomingOffset;
+        const count = Math.min(wanted - copied, available);
+        HEAPU8.set(chunk.subarray(link.incomingOffset, link.incomingOffset + count), dst + copied);
+        copied += count;
+        link.incomingOffset += count;
+        link.incomingBytes -= count;
+        if (link.incomingOffset === chunk.length) {
+            link.incoming.shift();
+            link.incomingOffset = 0;
+        }
+    }
+    return copied;
 });
 
 EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, size_t len), {
     const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
     if (!link) return -1;
     try {
+        if (!link.writer) {
+            const stream = await link.streamPromise;
+            link.reader = stream.readable.getReader();
+            link.writer = stream.writable.getWriter();
+            link.readPump = (async () => {
+                try {
+                    for (;;) {
+                        const result = await link.reader.read();
+                        if (result.done) break;
+                        if (result.value?.length) {
+                            link.incoming.push(result.value);
+                            link.incomingBytes += result.value.length;
+                            if (link.dataSignalResolve) link.dataSignalResolve();
+                            link.dataSignal = null;
+                            link.dataSignalResolve = null;
+                        }
+                    }
+                } catch (_) {
+                    // The transport's closed promise carries the detailed error.
+                } finally {
+                    link.closed = true;
+                }
+            })();
+            link.transport.closed.catch(() => {}).finally(() => { link.closed = true; });
+        }
+        if (link.closed || link.writeError) return -1;
         const bytes = HEAPU8.slice(src, src + len);
-        await link.writer.write(bytes);
+        // WritableStream serializes writes in call order. Do not wait for the
+        // network on every Pico message; observe failure asynchronously and
+        // let desiredSize provide bounded backpressure when the stream fills.
+        const write = link.writer.write(bytes);
+        write.catch(() => { link.writeError = true; link.closed = true; });
+        if (link.writer.desiredSize !== null && link.writer.desiredSize <= 0) await write;
         return len;
     } catch (_) {
         return -1;
     }
 });
 
+EM_JS(void, _zp_webtransport_js_set_nonblocking, (int enabled), {
+    const registry = globalThis.__zenohPicoWebTransport;
+    if (!registry) return;
+    for (const link of registry.links.values()) link.nonblocking = !!enabled;
+});
+
+EMSCRIPTEN_KEEPALIVE
+void _z_webtransport_transport_set_nonblocking(bool enabled) {
+    _zp_webtransport_js_set_nonblocking(enabled ? 1 : 0);
+}
+
 EM_JS(void, _zp_webtransport_js_close, (int handle), {
     const registry = globalThis.__zenohPicoWebTransport;
     const link = registry?.links.get(handle);
     if (!link) return;
-    link.reader.cancel().catch(() => {});
-    link.writer.close().catch(() => {});
+    if (link.reader) link.reader.cancel().catch(() => {});
+    if (link.writer) link.writer.close().catch(() => {});
     link.transport.close();
     registry.links.delete(handle);
 });
