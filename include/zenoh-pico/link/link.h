@@ -22,6 +22,7 @@
 #include "zenoh-pico/link/transport/tcp.h"
 #include "zenoh-pico/link/transport/udp_unicast.h"
 #include "zenoh-pico/link/transport/ws.h"
+#include "zenoh-pico/link/transport/webtransport.h"
 #include "zenoh-pico/protocol/iobuf.h"
 #include "zenoh-pico/system/platform.h"
 #include "zenoh-pico/utils/config.h"
@@ -110,6 +111,7 @@ enum _z_link_type_e {
     _Z_LINK_TYPE_BT,
     _Z_LINK_TYPE_SERIAL,
     _Z_LINK_TYPE_WS,
+    _Z_LINK_TYPE_WEBTRANSPORT,
     _Z_LINK_TYPE_TLS,
     _Z_LINK_TYPE_RAWETH,
 };
@@ -132,6 +134,9 @@ typedef struct _z_link_t {
 #endif
 #if Z_FEATURE_LINK_WS == 1
         _z_ws_socket_t _ws;
+#endif
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
+        _z_webtransport_socket_t _webtransport;
 #endif
 #if Z_FEATURE_LINK_TLS == 1
         _z_tls_socket_t _tls;

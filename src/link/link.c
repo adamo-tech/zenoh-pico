@@ -75,6 +75,11 @@ z_result_t _z_open_link(_z_link_t *zl, const _z_string_t *locator, const _z_conf
             ret = _z_new_link_ws(zl, &ep);
         } else
 #endif
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
+            if (_z_endpoint_webtransport_valid(&ep) == _Z_RES_OK) {
+            ret = _z_new_link_webtransport(zl, &ep);
+        } else
+#endif
 #if Z_FEATURE_LINK_TLS == 1
             if (_z_endpoint_tls_valid(&ep) == _Z_RES_OK) {
             ret = _z_new_link_tls(zl, &ep, session_cfg);
@@ -250,6 +255,10 @@ const _z_sys_net_socket_t *_z_link_get_socket(const _z_link_t *link) {
 #if Z_FEATURE_LINK_WS == 1
         case _Z_LINK_TYPE_WS:
             return &link->_socket._ws._sock;
+#endif
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
+        case _Z_LINK_TYPE_WEBTRANSPORT:
+            return &link->_socket._webtransport._sock;
 #endif
 #if Z_FEATURE_LINK_TLS == 1
         case _Z_LINK_TYPE_TLS:

@@ -45,6 +45,12 @@ typedef struct {
             uint32_t _tout;
         } _ws;
 #endif
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
+        struct {
+            int _handle;
+            uint32_t _tout;
+        } _webtransport;
+#endif
     };
 } _z_sys_net_socket_t;
 
@@ -52,6 +58,9 @@ typedef struct {
     union {
 #if Z_FEATURE_LINK_WS == 1
         struct addrinfo *_iptcp;
+#endif
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
+        char *_webtransport_url;
 #endif
     };
 } _z_sys_net_endpoint_t;
