@@ -44,12 +44,19 @@ z_result_t _z_liveliness_process_remote_token_declare(_z_session_t *zn, uint32_t
 
     const _z_keyexpr_t *pkeyexpr = _z_keyexpr_intmap_get(&zn->_remote_tokens, id);
     if (pkeyexpr != NULL) {
-        // Already received this token
-        _Z_DEBUG("Duplicate token id %i", (int)id);
-        ret = _z_keyexpr_equals(pkeyexpr, &ke) ? _Z_RES_OK : _Z_ERR_KEYEXPR_NOT_MATCH;
+        // A router can replay the same remote token id through overlapping
+        // history-enabled interests. Some router versions also reuse an id
+        // for another matching token in that replay. The remote-token table
+        // cannot represent the latter alias, but it must not turn a harmless
+        // discovery collision into a fatal transport read error.
+        if (_z_keyexpr_equals(pkeyexpr, &ke)) {
+            _Z_DEBUG("Duplicate token id %i", (int)id);
+        } else {
+            _Z_WARN("Ignoring conflicting duplicate remote token id %i", (int)id);
+        }
         _z_session_mutex_unlock(zn);
         _z_keyexpr_clear(&ke);
-        return ret;
+        return _Z_RES_OK;
     } else {
         _z_keyexpr_t *ke_on_heap = (_z_keyexpr_t *)z_malloc(sizeof(_z_keyexpr_t));
         if (ke_on_heap == NULL || _z_keyexpr_intmap_insert(&zn->_remote_tokens, id, ke_on_heap) == NULL) {
