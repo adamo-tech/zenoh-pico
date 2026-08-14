@@ -173,8 +173,14 @@ static z_result_t _z_liveliness_pending_query_reply(_z_session_t *zn, uint32_t i
         _Z_DEBUG("Reply liveliness query for %.*s", (int)_z_string_len(&ke._keyexpr), _z_string_data(&ke._keyexpr));
 
         if (!_z_keyexpr_intersects(&pq->_key, &ke)) {
-            _Z_ERROR_LOG(_Z_ERR_QUERY_NOT_MATCH);
-            ret = _Z_ERR_QUERY_NOT_MATCH;
+            // Routers may include unrelated token declarations in a CURRENT
+            // interest snapshot. They are not a protocol error: filter them
+            // locally and keep the transport alive so later matching replies
+            // can still reach the query callback.
+            _Z_DEBUG("Ignoring unrelated liveliness query reply for %.*s",
+                     (int)_z_string_len(&ke._keyexpr), _z_string_data(&ke._keyexpr));
+            ret = _Z_RES_OK;
+            goto cleanup;
         }
 
         if (ret == _Z_RES_OK) {
@@ -191,6 +197,7 @@ static z_result_t _z_liveliness_pending_query_reply(_z_session_t *zn, uint32_t i
         }
     }
 
+cleanup:
     _z_session_mutex_unlock(zn);
     _z_keyexpr_clear(&ke);
 
