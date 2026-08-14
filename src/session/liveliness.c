@@ -219,8 +219,17 @@ z_result_t _z_liveliness_process_token_declare(_z_session_t *zn, const _z_n_msg_
                                                _z_transport_peer_common_t *peer) {
 #if Z_FEATURE_QUERY == 1
     if (decl->_interest_id.has_value) {
-        _z_liveliness_pending_query_reply(zn, decl->_interest_id.value, &decl->_decl._body._decl_token._keyexpr,
-                                          &decl->_ext_timestamp, peer);
+        z_result_t query_ret =
+            _z_liveliness_pending_query_reply(zn, decl->_interest_id.value,
+                                              &decl->_decl._body._decl_token._keyexpr,
+                                              &decl->_ext_timestamp, peer);
+        if (query_ret == _Z_RES_OK) {
+            // A CURRENT-only liveliness query uses token declarations as
+            // replies. They are snapshots, not persistent remote-token
+            // declarations, and must not enter the remote token cache.
+            return _Z_RES_OK;
+        }
+        if (query_ret != _Z_ERR_ENTITY_UNKNOWN) return query_ret;
     }
 #endif
 

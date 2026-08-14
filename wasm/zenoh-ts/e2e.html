@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>zenoh-pico WebTransport E2E</title>
+<pre id="result">RUNNING</pre>
+<script type="module">
+import {createZenohPico} from "./index.mjs";
+
+const output = document.querySelector("#result");
+const certificateHash = "nYssBVdaYdbVnmBjLeFKA2ZCroIMlXzn3CTN6kmRUP0=";
+const endpoint = "webtransport/127.0.0.1:7448#tout=10000";
+
+try {
+    const pico = await createZenohPico({certificateHash});
+    const publisherSession = await pico.open(endpoint);
+    const subscriberSession = await pico.open(endpoint);
+    const received = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("sample timeout")), 5000);
+        subscriberSession.declareSubscriber("test/wasm/e2e", sample => {
+            clearTimeout(timeout);
+            resolve(new TextDecoder().decode(sample.payload));
+        }).catch(reject);
+    });
+    await new Promise(resolve => setTimeout(resolve, 250));
+    await publisherSession.put("test/wasm/e2e", new TextEncoder().encode("webtransport-ok"));
+    const value = await received;
+    if (value !== "webtransport-ok") throw new Error(`unexpected payload: ${value}`);
+    await publisherSession.close();
+    await subscriberSession.close();
+    output.textContent = "PASS";
+    document.title = "PASS";
+} catch (error) {
+    output.textContent = `FAIL: ${error?.stack || error}`;
+    document.title = "FAIL";
+}
+</script>
