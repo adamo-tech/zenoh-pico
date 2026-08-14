@@ -13,6 +13,7 @@
   "files": [
     "index.d.ts",
     "index.mjs",
+    "test/loader.test.mjs",
     "zenoh-pico.mjs",
     "zenoh-pico.wasm"
   ],
@@ -23,5 +24,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
   }
 }
