@@ -1,0 +1,636 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zenoh-Pico WebTransport browser tests</title>
+<style>
+body { font: 15px system-ui; margin: 2rem auto; max-width: 70rem; padding: 0 1rem; color: #18202a; }
+h1 { margin-bottom: .25rem; }
+#summary { font-size: 1.15rem; margin: 1rem 0; padding: 1rem; border-radius: .5rem; background: #eef2f6; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: .65rem; border-bottom: 1px solid #d9dee5; text-align: left; vertical-align: top; }
+.running { color: #7a5b00; } .pass { color: #087830; } .fail { color: #b00020; font-weight: 650; }
+pre { white-space: pre-wrap; font-size: 12px; margin: .3rem 0 0; }
+button { padding: .7rem 1rem; font: inherit; }
+</style>
+<h1>Zenoh-Pico WebTransport browser tests</h1>
+<p>Real browser → WebTransport → zenohd tests. The reconnect case deliberately restarts zenohd.</p>
+<button id="run">Run all tests</button>
+<div id="summary">Ready.</div>
+<table><thead><tr><th>Feature</th><th>Result</th><th>Details</th></tr></thead><tbody id="results"></tbody></table>
+<h2>Benchmarks</h2>
+<table><thead><tr><th>Benchmark</th><th>Result</th><th>Measurements</th></tr></thead><tbody id="benchmarks"></tbody></table>
+<script type="module">
+import {createZenohPico, SampleKind, Priority, CongestionControl, Reliability, PicoTimestamp,
+    QueryTarget, ConsolidationMode, ReplyKeyExpr, PicoReplyError} from "./index.mjs";
+
+const endpoint = "webtransport/127.0.0.1:7448#tout=3000";
+const certificateHash = "nYssBVdaYdbVnmBjLeFKA2ZCroIMlXzn3CTN6kmRUP0=";
+const query = new URLSearchParams(location.search);
+const configuredReceiveBufferBytes = Number(query.get("receiveBufferBytes") || 65536);
+const stopAfterFragment = query.has("stopAfterFragment");
+const stopAfterTimestamp = query.has("stopAfterTimestamp");
+const stopAfterLivelinessGet = query.has("stopAfterLivelinessGet");
+const stopAfterSessionGet = query.has("stopAfterSessionGet");
+const stopAfterBenchmarks = query.has("stopAfterBenchmarks");
+const rows = new Map();
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const wasmDiagnostics = [];
+function recordDiagnostic(diagnostic) {
+    wasmDiagnostics.push(diagnostic);
+    if (wasmDiagnostics.length > 200) wasmDiagnostics.splice(0, wasmDiagnostics.length - 200);
+}
+
+function transportDiagnostics(sessionA, sessionB) {
+    return JSON.stringify({sender: sessionA?.diagnostics(), receiver: sessionB?.diagnostics(), wasmDiagnostics}, null, 2);
+}
+
+function row(name) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${name}</td><td class="running">RUNNING</td><td><pre></pre></td>`;
+    results.append(tr); rows.set(name, tr); return tr;
+}
+function percentile(sorted, fraction) { return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))]; }
+function errorText(error) {
+    const message = error?.message || String(error);
+    const stack = error?.stack;
+    return stack && !stack.includes(message) ? `${message}\n${stack}` : (stack || message);
+}
+async function benchmark(name, action) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${name}</td><td class="running">RUNNING</td><td><pre></pre></td>`;
+    benchmarks.append(tr);
+    try {
+        const detail = await action();
+        tr.children[1].textContent = "MEASURED"; tr.children[1].className = "pass";
+        tr.querySelector("pre").textContent = detail;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({name, status: "BENCHMARK", detail})}).catch(() => {});
+    } catch (error) {
+        tr.children[1].textContent = "FAIL"; tr.children[1].className = "fail";
+        tr.querySelector("pre").textContent = errorText(error);
+        fetch("/control/report", {method: "POST", body: JSON.stringify({name, status: "BENCHMARK_FAIL", detail: errorText(error)})}).catch(() => {});
+    }
+}
+async function test(name, action) {
+    const tr = row(name);
+    const started = performance.now();
+    try {
+        const detail = await action();
+        tr.children[1].textContent = "PASS"; tr.children[1].className = "pass";
+        tr.querySelector("pre").textContent = `${detail ?? ""} (${(performance.now() - started).toFixed(0)} ms)`;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({name, status: "PASS", detail})}).catch(() => {});
+        return true;
+    } catch (error) {
+        tr.children[1].textContent = "FAIL"; tr.children[1].className = "fail";
+        tr.querySelector("pre").textContent = errorText(error);
+        fetch("/control/report", {method: "POST", body: JSON.stringify({name, status: "FAIL", detail: errorText(error)})}).catch(() => {});
+        return false;
+    }
+}
+function equalBytes(actual, expected) {
+    if (actual.length !== expected.length) throw new Error(`length ${actual.length}, expected ${expected.length}`);
+    for (let i = 0; i < actual.length; i++) if (actual[i] !== expected[i]) throw new Error(`byte mismatch at ${i}`);
+}
+function statsDelta(after, before) {
+    return Object.fromEntries(Object.keys(after).map(key => [key, after[key] - before[key]]));
+}
+function mibPerSecond(bytes, milliseconds) {
+    return bytes / 1048576 / (milliseconds / 1000);
+}
+async function waitUntil(predicate, timeoutMs, description) {
+    const deadline = performance.now() + timeoutMs;
+    while (!predicate()) {
+        if (performance.now() >= deadline) throw new Error(`timeout waiting for ${description}`);
+        await sleep(10);
+    }
+}
+function inbox() {
+    const queued = [];
+    const waiters = [];
+    return {
+        callback(sample) { const waiter = waiters.shift(); waiter ? waiter.resolve(sample) : queued.push(sample); },
+        next(timeoutMs = 5000) {
+            if (queued.length) return Promise.resolve(queued.shift());
+            return new Promise((resolve, reject) => {
+                const waiter = {resolve: value => { clearTimeout(timer); resolve(value); }};
+                const timer = setTimeout(() => {
+                    const index = waiters.indexOf(waiter); if (index >= 0) waiters.splice(index, 1);
+                    reject(new Error(`sample timeout after ${timeoutMs} ms`));
+                }, timeoutMs);
+                waiters.push(waiter);
+            });
+        },
+    };
+}
+async function restartRouter(action) {
+    const response = await fetch(`/control/router/${action}`, {method: "POST"});
+    if (!response.ok) throw new Error(await response.text());
+}
+
+async function runAll() {
+    run.disabled = true; results.replaceChildren(); benchmarks.replaceChildren(); rows.clear();
+    summary.textContent = "Running…";
+    let passed = 0, total = 0;
+    const check = async (name, fn) => { total++; if (await test(name, fn)) passed++; };
+    let pico, sessionA, sessionB;
+
+    await check("ES module, WASM and ABI v7", async () => {
+        pico = await createZenohPico({
+            certificateHash,
+            receiveBufferBytes: configuredReceiveBufferBytes,
+            onDiagnostic(diagnostic) {
+                recordDiagnostic(diagnostic);
+                fetch("/control/report", {method: "POST", body: JSON.stringify({
+                    name: "WASM diagnostic", status: "DIAGNOSTIC", detail: diagnostic,
+                })}).catch(() => {});
+            },
+            printErr(message) {
+                recordDiagnostic({type: "stderr", message});
+            },
+            print(message) {
+                recordDiagnostic({type: "stdout", message});
+            },
+        });
+        return `Modular package initialized and ABI check accepted; receive buffer ${configuredReceiveBufferBytes} B`;
+    });
+    await check("Certificate hash rejection", async () => {
+        const bad = await createZenohPico({certificateHash: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
+        try { await bad.open(endpoint); } catch (_) { return "Incorrect SHA-256 hash rejected"; }
+        throw new Error("connection unexpectedly accepted an incorrect certificate hash");
+    });
+    await check("Two concurrent sessions", async () => {
+        sessionA = await pico.open(endpoint); sessionB = await pico.open(endpoint);
+        return "Both sessions opened in isolated WASM instances in the same JavaScript realm";
+    });
+    await check("Session identity", async () => {
+        const a = (await sessionA.info()).zid.toString();
+        const b = (await sessionB.info()).zid.toString();
+        if (!/^[0-9a-f]{32}$/.test(a) || !/^[0-9a-f]{32}$/.test(b)) throw new Error(`invalid zids: ${a}, ${b}`);
+        if (a === b) throw new Error(`independent sessions unexpectedly share zid ${a}`);
+        return `Distinct 128-bit Zenoh IDs reported (${a}, ${b})`;
+    });
+    await check("Session put and generic subscriber callback", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/session", box.callback);
+        await sleep(200); const expected = Uint8Array.of(0, 1, 2, 127, 128, 255);
+        await sessionA.put("test/browser/session", expected);
+        const sample = await box.next(); equalBytes(sample.payload, expected);
+        if (sample.keyExpr !== "test/browser/session" || sample.kind !== SampleKind.PUT) throw new Error("sample metadata mismatch");
+        await sub.undeclare(); return "Binary payload, key expression and PUT kind matched";
+    });
+    await check("Session put QoS metadata", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/session-qos", box.callback);
+        const publisher = await sessionA.declarePublisher("test/browser/timestamp"); await sleep(150);
+        await sessionA.put("test/browser/session-qos", Uint8Array.of(42), {
+            priority: Priority.REAL_TIME,
+            congestionControl: CongestionControl.DROP,
+            reliability: Reliability.BEST_EFFORT,
+            express: true,
+        });
+        const sample = await box.next();
+        if (sample.priority !== Priority.REAL_TIME ||
+            sample.congestionControl !== CongestionControl.DROP ||
+            sample.reliability !== Reliability.BEST_EFFORT || !sample.express) {
+            throw new Error(`received QoS mismatch: ${JSON.stringify(sample)}`);
+        }
+        await sub.undeclare(); return "REAL_TIME, DROP, BEST_EFFORT and express observed by subscriber";
+    });
+    await check("Publisher timestamp round-trip", async () => {
+        const box = inbox(); const localBox = inbox();
+        const sub = await sessionB.declareSubscriber("test/browser/timestamp", box.callback);
+        const localSub = await sessionA.declareSubscriber("test/browser/timestamp", localBox.callback);
+        const publisher = await sessionA.declarePublisher("test/browser/timestamp"); await sleep(150);
+        try {
+            const zid = (await sessionA.info()).zid;
+            const expected = new PicoTimestamp(zid, 0x12345678abcdef01n);
+            await publisher.put(Uint8Array.of(7), {timestamp: expected});
+            const localTimestamp = (await localBox.next()).timestamp;
+            const actual = (await box.next()).timestamp;
+            if (!actual) throw new Error(`remote sample has no timestamp; local sample timestamp: ${localTimestamp ? `0x${localTimestamp.getNtp64().toString(16)}` : "missing"}; diagnostics: ${JSON.stringify(wasmDiagnostics)}`);
+            if (actual.getId().toString() !== zid.toString() || actual.getNtp64() !== expected.getNtp64()) {
+                throw new Error(`timestamp mismatch: ${actual.getId()} ${actual.getNtp64().toString(16)}`);
+            }
+            return `Exact Zenoh ID and NTP64 value 0x${expected.getNtp64().toString(16)} preserved`;
+        } finally {
+            await publisher.undeclare(); await localSub.undeclare(); await sub.undeclare();
+        }
+    });
+    if (stopAfterTimestamp) {
+        await sessionA.close(); await sessionB.close();
+        summary.textContent = `${passed}/${total} timestamp diagnostic tests passed`;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({status: "TIMESTAMP_FINAL", passed, total})}).catch(() => {});
+        run.disabled = false;
+        return;
+    }
+    await check("Session get request payload, multiple replies and completion", async () => {
+        const requests = [];
+        const queryable = await sessionA.declareQueryable("test/browser/query/**", async incoming => {
+            requests.push({keyExpr: incoming.keyExpr, parameters: incoming.parameters, payload: incoming.payload});
+            await incoming.reply(encoder.encode("first"));
+            await incoming.reply(Uint8Array.of(0, 127, 128, 255), {keyExpr: "test/browser/query/alternate"});
+        }, {complete: true});
+        try {
+            await sleep(150);
+            const receiver = await sessionB.get("test/browser/query/request", {
+                parameters: "mode=browser&count=2",
+                payload: Uint8Array.of(1, 2, 3, 254, 255),
+                timeoutMs: 2000,
+                priority: Priority.INTERACTIVE_HIGH,
+                congestionControl: CongestionControl.DROP,
+                express: true,
+                target: QueryTarget.ALL,
+                consolidation: ConsolidationMode.NONE,
+                acceptReplies: ReplyKeyExpr.ANY,
+            });
+            const replies = [];
+            for await (const reply of receiver) {
+                if (!reply.isOk()) throw new Error("unexpected error reply");
+                replies.push(reply.result());
+            }
+            if (requests.length !== 1) throw new Error(`queryable received ${requests.length} requests`);
+            const request = requests[0];
+            if (request.keyExpr !== "test/browser/query/request" ||
+                request.parameters !== "mode=browser&count=2;_anyke") {
+                throw new Error(`request metadata mismatch: ${JSON.stringify(request)}`);
+            }
+            equalBytes(request.payload, Uint8Array.of(1, 2, 3, 254, 255));
+            if (replies.length !== 2) throw new Error(`received ${replies.length} replies, expected 2`);
+            const byKey = new Map(replies.map(sample => [sample.keyExpr, sample.payload]));
+            equalBytes(byKey.get("test/browser/query/request"), encoder.encode("first"));
+            equalBytes(byKey.get("test/browser/query/alternate"), Uint8Array.of(0, 127, 128, 255));
+            return "Binary request and parameters reached queryable; two binary replies completed";
+        } finally {
+            await queryable.undeclare();
+        }
+    });
+    await check("Session get error reply", async () => {
+        const queryable = await sessionA.declareQueryable("test/browser/query-error", async incoming => {
+            await incoming.replyError(Uint8Array.of(222, 173, 190, 239));
+        });
+        try {
+            await sleep(150);
+            const replies = [];
+            for await (const reply of await sessionB.get("test/browser/query-error", {timeoutMs: 2000})) {
+                replies.push(reply);
+            }
+            if (replies.length !== 1 || replies[0].isOk()) {
+                throw new Error(`expected one error reply, got ${replies.length}`);
+            }
+            const error = replies[0].result();
+            if (!(error instanceof PicoReplyError)) throw new Error("error result has wrong type");
+            equalBytes(error.payload, Uint8Array.of(222, 173, 190, 239));
+            return "Binary query error surfaced and receiver completed";
+        } finally {
+            await queryable.undeclare();
+        }
+    });
+    await check("Concurrent session gets and timeout error", async () => {
+        const queryable = await sessionA.declareQueryable("test/browser/query-concurrent/**", async incoming => {
+            if (incoming.keyExpr.endsWith("slow")) await sleep(250);
+            await incoming.reply(encoder.encode(incoming.keyExpr.split("/").at(-1)));
+        });
+        try {
+            await sleep(150);
+            const collect = async receiver => {
+                const values = [];
+                for await (const reply of receiver) values.push(decoder.decode(reply.result().payload));
+                return values;
+            };
+            const [one, two] = await Promise.all([
+                sessionB.get("test/browser/query-concurrent/one", {timeoutMs: 2000}).then(collect),
+                sessionB.get("test/browser/query-concurrent/two", {timeoutMs: 2000}).then(collect),
+            ]);
+            if (one.join() !== "one" || two.join() !== "two") {
+                throw new Error(`concurrent replies crossed: one=${one}, two=${two}`);
+            }
+            const started = performance.now();
+            const slow = await sessionB.get("test/browser/query-concurrent/slow", {timeoutMs: 50});
+            const slowReplies = [];
+            for await (const reply of slow) {
+                const result = reply.result();
+                slowReplies.push(reply.isOk()
+                    ? {ok: true, keyExpr: result.keyExpr, payload: decoder.decode(result.payload)}
+                    : {ok: false, payload: Array.from(result.payload)});
+            }
+            const elapsed = performance.now() - started;
+            const timeoutPayload = slowReplies.length === 1 && !slowReplies[0].ok
+                ? decoder.decode(Uint8Array.from(slowReplies[0].payload))
+                : "";
+            if (timeoutPayload !== "Timeout" || elapsed > 1000) {
+                throw new Error(`timeout yielded ${JSON.stringify(slowReplies)} after ${elapsed.toFixed(0)} ms`);
+            }
+            return `Concurrent receivers stayed isolated; timeout surfaced as ReplyError in ${elapsed.toFixed(0)} ms`;
+        } finally {
+            await queryable.undeclare();
+        }
+    });
+    if (stopAfterSessionGet) {
+        await sessionA.close(); await sessionB.close();
+        summary.textContent = `${passed}/${total} session-get diagnostic tests passed`;
+        summary.className = passed === total ? "pass" : "fail";
+        document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} session-get diagnostic tests`;
+        run.disabled = false;
+        return;
+    }
+    await check("Liveliness token PUT and DELETE", async () => {
+        const box = inbox();
+        const subscriber = await sessionB.liveliness().declareSubscriber("test/browser/alive/dynamic", box.callback);
+        let token;
+        try {
+            await sleep(150);
+            token = await sessionA.liveliness().declareToken("test/browser/alive/dynamic");
+            const put = await box.next();
+            if (put.kind !== SampleKind.PUT || put.keyExpr !== "test/browser/alive/dynamic") {
+                throw new Error(`unexpected liveliness declaration: ${JSON.stringify(put)}`);
+            }
+            await token.undeclare(); token = undefined;
+            const deleted = await box.next();
+            if (deleted.kind !== SampleKind.DELETE || deleted.keyExpr !== "test/browser/alive/dynamic") {
+                throw new Error(`unexpected liveliness undeclaration: ${JSON.stringify(deleted)}`);
+            }
+            return "Token declaration produced PUT and undeclaration produced DELETE";
+        } finally {
+            await token?.undeclare(); await subscriber.undeclare();
+        }
+    });
+    await check("Liveliness subscriber history", async () => {
+        const token = await sessionA.liveliness().declareToken("test/browser/alive/history");
+        let subscriber;
+        try {
+            await sleep(150); const box = inbox();
+            subscriber = await sessionB.liveliness().declareSubscriber("test/browser/alive/**", box.callback, {history: true});
+            const sample = await box.next();
+            if (sample.kind !== SampleKind.PUT || sample.keyExpr !== "test/browser/alive/history") {
+                throw new Error(`unexpected historical liveliness sample: ${JSON.stringify(sample)}`);
+            }
+            return "Existing token replayed immediately to history-enabled subscriber";
+        } finally {
+            await subscriber?.undeclare(); await token.undeclare();
+        }
+    });
+    await check("Publisher matching status transitions", async () => {
+        const publisher = await sessionA.declarePublisher("test/browser/matching");
+        const transitions = [];
+        let listener, subscriber;
+        try {
+            await sleep(150);
+            if ((await publisher.matchingStatus()).matching) throw new Error("publisher unexpectedly matched initially");
+            listener = await publisher.declareMatchingListener(status => transitions.push(status.matching));
+            subscriber = await sessionB.declareSubscriber("test/browser/matching", () => {});
+            await waitUntil(() => transitions.includes(true), 5000, "publisher matching transition");
+            if (!(await publisher.matchingStatus()).matching) throw new Error("matching status remained false");
+            await subscriber.undeclare(); subscriber = undefined;
+            await waitUntil(() => transitions.lastIndexOf(false) > transitions.lastIndexOf(true), 5000,
+                "publisher unmatching transition");
+            if ((await publisher.matchingStatus()).matching) throw new Error("matching status remained true");
+            return `Initial false, then transitions ${transitions.join(" → ")}`;
+        } finally {
+            await subscriber?.undeclare(); await listener?.undeclare(); await publisher.undeclare();
+        }
+    });
+    await check("Liveliness get multiple replies and completion", async () => {
+        const tokenA = await sessionA.liveliness().declareToken("test/browser/alive/get/a");
+        const tokenB = await sessionA.liveliness().declareToken("test/browser/alive/get/b");
+        try {
+            await sleep(150);
+            const receiver = await sessionB.liveliness().get("test/browser/alive/get/*", {timeoutMs: 2000});
+            const keys = [];
+            await Promise.race([
+                (async () => { for await (const sample of receiver) keys.push(sample.keyExpr); })(),
+                sleep(5000).then(() => { throw new Error(`liveliness get did not complete; replyCount=${keys.length}; firstReplies=${JSON.stringify(keys.slice(0, 20))}; transport=${transportDiagnostics(sessionA, sessionB)}; recentDiagnostics=${JSON.stringify(wasmDiagnostics.slice(-100))}`); }),
+            ]);
+            keys.sort();
+            const expected = ["test/browser/alive/get/a", "test/browser/alive/get/b"];
+            if (JSON.stringify(keys) !== JSON.stringify(expected)) {
+                throw new Error(`liveliness get replies ${JSON.stringify(keys)}, expected ${JSON.stringify(expected)}`);
+            }
+            return `Two replies received and async receiver completed (${keys.join(", ")})`;
+        } finally {
+            await tokenA.undeclare(); await tokenB.undeclare();
+        }
+    });
+    if (stopAfterLivelinessGet) {
+        await sessionA.close(); await sessionB.close();
+        summary.textContent = `${passed}/${total} liveliness diagnostic tests passed`;
+        summary.className = passed === total ? "pass" : "fail";
+        document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} liveliness diagnostic tests`;
+        run.disabled = false;
+        return;
+    }
+    await check("Session delete", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/delete", box.callback);
+        await sleep(150); await sessionA.delete("test/browser/delete"); const sample = await box.next();
+        if (sample.kind !== SampleKind.DELETE) throw new Error(`kind ${sample.kind}, expected DELETE`);
+        await sub.undeclare(); return "DELETE sample received";
+    });
+    await check("Publisher declare and put", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/publisher", box.callback);
+        const publisher = await sessionA.declarePublisher("test/browser/publisher"); await sleep(150);
+        await publisher.put(encoder.encode("publisher-ok")); const sample = await box.next();
+        if (decoder.decode(sample.payload) !== "publisher-ok") throw new Error("publisher payload mismatch");
+        await publisher.undeclare(); await sub.undeclare(); return "Declared publisher delivered payload";
+    });
+    await check("Declared publisher QoS metadata", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/publisher-qos", box.callback);
+        const publisher = await sessionA.declarePublisher("test/browser/publisher-qos", {
+            priority: Priority.BACKGROUND,
+            congestionControl: CongestionControl.BLOCK,
+            reliability: Reliability.RELIABLE,
+            express: true,
+        });
+        await sleep(150); await publisher.put(Uint8Array.of(99)); const sample = await box.next();
+        if (sample.priority !== Priority.BACKGROUND ||
+            sample.congestionControl !== CongestionControl.BLOCK ||
+            sample.reliability !== Reliability.RELIABLE || !sample.express) {
+            throw new Error(`received publisher QoS mismatch: ${JSON.stringify(sample)}`);
+        }
+        await publisher.undeclare(); await sub.undeclare();
+        return "BACKGROUND, BLOCK, RELIABLE and express observed by subscriber";
+    });
+    await check("Publisher delete", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/pub-delete", box.callback);
+        const publisher = await sessionA.declarePublisher("test/browser/pub-delete"); await sleep(150);
+        await publisher.delete(); const sample = await box.next();
+        if (sample.kind !== SampleKind.DELETE) throw new Error("publisher delete kind mismatch");
+        await publisher.undeclare(); await sub.undeclare(); return "Publisher DELETE sample received";
+    });
+    await check("Subscriber undeclare", async () => {
+        let calls = 0; const sub = await sessionB.declareSubscriber("test/browser/undeclare", () => calls++);
+        await sleep(100); await sub.undeclare(); await sleep(100);
+        await sessionA.put("test/browser/undeclare", encoder.encode("ignored")); await sleep(500);
+        if (calls !== 0) throw new Error(`callback ran ${calls} times after undeclare`);
+        return "No callback after undeclaration";
+    });
+    await check("Fragmented 1 MiB binary sample", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/fragment", box.callback);
+        await sleep(150);
+        const sizes = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+        try {
+            for (const size of sizes) {
+                const expected = new Uint8Array(size);
+                for (let i = 0; i < expected.length; i++) expected[i] = (i * 31) & 255;
+                const before = transportDiagnostics(sessionA, sessionB);
+                await sessionA.put("test/browser/fragment", expected);
+                try {
+                    equalBytes((await box.next(15000)).payload, expected);
+                } catch (error) {
+                    throw new Error(`First failing payload size: ${size} B; put returned success.\nBefore:\n${before}\nAfter:\n${transportDiagnostics(sessionA, sessionB)}`, {cause: error});
+                }
+            }
+        } finally {
+            await sub.undeclare();
+        }
+        return `Payload sweep passed through 1 MiB (${sizes.join(", ")} B), byte-for-byte`;
+    });
+    if (stopAfterFragment) {
+        await sessionA.close(); await sessionB.close();
+        summary.textContent = `${passed}/${total} diagnostic tests passed`;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({status: "DIAGNOSTIC_FINAL", passed, total, configuredReceiveBufferBytes})}).catch(() => {});
+        run.disabled = false;
+        return;
+    }
+    await check("Bounded receive-buffer stress", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/stress", box.callback);
+        await sleep(150); const payload = new Uint8Array(32768); payload.fill(0x5a); const count = 64;
+        for (let i = 0; i < count; i++) await sessionA.put("test/browser/stress", payload);
+        for (let i = 0; i < count; i++) {
+            try { equalBytes((await box.next(15000)).payload, payload); }
+            catch (error) { throw new Error(`Received ${i}/${count} samples.\n${transportDiagnostics(sessionA, sessionB)}`, {cause: error}); }
+        }
+        await sub.undeclare(); return "64 × 32 KiB delivered through a configured 64 KiB receive bound";
+    });
+    await benchmark("End-to-end latency", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("bench/browser/latency", box.callback);
+        const publisher = await sessionA.declarePublisher("bench/browser/latency"); await sleep(200);
+        const payload = new Uint8Array(32); const samples = [];
+        for (let i = 0; i < 10; i++) { const received = box.next(); await publisher.put(payload); await received; }
+        for (let i = 0; i < 100; i++) {
+            const received = box.next(); const started = performance.now(); await publisher.put(payload); await received;
+            samples.push(performance.now() - started);
+        }
+        samples.sort((a, b) => a - b); await publisher.undeclare(); await sub.undeclare();
+        return `100 messages × 32 B · p50 ${percentile(samples, .50).toFixed(2)} ms · p95 ${percentile(samples, .95).toFixed(2)} ms · p99 ${percentile(samples, .99).toFixed(2)} ms`;
+    });
+    await benchmark("Small-message throughput", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("bench/browser/messages", box.callback);
+        const publisher = await sessionA.declarePublisher("bench/browser/messages"); await sleep(200);
+        const count = 1000, payload = new Uint8Array(256), started = performance.now();
+        for (let i = 0; i < count; i++) await publisher.put(payload);
+        for (let i = 0; i < count; i++) await box.next(30000);
+        const seconds = (performance.now() - started) / 1000; await publisher.undeclare(); await sub.undeclare();
+        return `${count} messages × 256 B in ${seconds.toFixed(3)} s · ${(count / seconds).toFixed(0)} messages/s`;
+    });
+    await benchmark("Binary bandwidth", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("bench/browser/bandwidth", box.callback);
+        const publisher = await sessionA.declarePublisher("bench/browser/bandwidth"); await sleep(200);
+        const count = 64, payload = new Uint8Array(32768), started = performance.now(); payload.fill(0xa5);
+        for (let i = 0; i < count; i++) await publisher.put(payload);
+        for (let i = 0; i < count; i++) {
+            try { equalBytes((await box.next(30000)).payload, payload); }
+            catch (error) { throw new Error(`Received ${i}/${count} samples.\n${transportDiagnostics(sessionA, sessionB)}`, {cause: error}); }
+        }
+        const seconds = (performance.now() - started) / 1000, mib = count * payload.length / 1048576;
+        await publisher.undeclare(); await sub.undeclare();
+        return `${mib.toFixed(1)} MiB in ${seconds.toFixed(3)} s · ${(mib / seconds).toFixed(1)} MiB/s · ${(count / seconds).toFixed(0)} messages/s`;
+    });
+    await benchmark("Payload-size scaling", async () => {
+        const lines = [];
+        for (const size of [256, 4096, 32768, 262144, 1048576]) {
+            const count = Math.max(4, Math.ceil((2 * 1048576) / size));
+            const bytes = count * size;
+            const payload = new Uint8Array(size); payload.fill(size & 255);
+            let invalidLength = 0; const box = inbox();
+            const key = `bench/browser/scale/${size}`;
+            const sub = await sessionB.declareSubscriber(key, box.callback);
+            const publisher = await sessionA.declarePublisher(key); await sleep(100);
+            const profileBefore = sessionA.performanceDiagnostics();
+            const started = performance.now();
+            for (let i = 0; i < count; i++) {
+                await publisher.put(payload);
+                if ((await box.next(30000)).payload.length !== size) invalidLength++;
+            }
+            const finished = performance.now();
+            const profile = statsDelta(sessionA.performanceDiagnostics(), profileBefore);
+            await publisher.undeclare(); await sub.undeclare();
+            if (invalidLength) throw new Error(`${invalidLength} payload(s) had the wrong length at ${size} B`);
+            lines.push(`${size.toLocaleString()} B × ${count}: one-in-flight end-to-end ${mibPerSecond(bytes, finished - started).toFixed(1)} MiB/s · ${((finished - started) / count).toFixed(2)} ms/message · heap copy ${profile.copyMs.toFixed(2)} ms · WASM/transport ${profile.wasmCallMs.toFixed(2)} ms`);
+        }
+        return lines.join("\n");
+    });
+    await benchmark("Serial vs concurrent submissions", async () => {
+        const size = 32768, count = 128, bytes = size * count;
+        const run = async strategy => {
+            const key = `bench/browser/submission/${strategy}`;
+            const payload = new Uint8Array(size); payload.fill(0x3c);
+            let received = 0;
+            const sub = await sessionB.declareSubscriber(key, sample => {
+                if (sample.payload.length === size) received++;
+            });
+            const publisher = await sessionA.declarePublisher(key); await sleep(100);
+            const started = performance.now();
+            if (strategy === "serial") {
+                for (let i = 0; i < count; i++) await publisher.put(payload);
+            } else {
+                await Promise.all(Array.from({length: count}, () => publisher.put(payload)));
+            }
+            const sentAt = performance.now();
+            await waitUntil(() => received === count, 30000, `${strategy} receipts`);
+            const finished = performance.now();
+            await publisher.undeclare(); await sub.undeclare();
+            return {send: mibPerSecond(bytes, sentAt - started), e2e: mibPerSecond(bytes, finished - started)};
+        };
+        const serial = await run("serial");
+        const concurrent = await run("concurrent");
+        return `128 × 32 KiB\nSerial awaits: sender ${serial.send.toFixed(1)} MiB/s · end-to-end ${serial.e2e.toFixed(1)} MiB/s\nConcurrent Promise.all: sender ${concurrent.send.toFixed(1)} MiB/s · end-to-end ${concurrent.e2e.toFixed(1)} MiB/s`;
+    });
+    await benchmark("Sustained binary bandwidth", async () => {
+        const size = 32768, payload = new Uint8Array(size); payload.fill(0xc3);
+        let received = 0;
+        const sub = await sessionB.declareSubscriber("bench/browser/sustained", sample => {
+            if (sample.payload.length === size) received++;
+        });
+        const publisher = await sessionA.declarePublisher("bench/browser/sustained"); await sleep(100);
+        const profileBefore = sessionA.performanceDiagnostics();
+        const started = performance.now(); let sent = 0;
+        while (performance.now() - started < 5000) { await publisher.put(payload); sent++; }
+        const sentAt = performance.now();
+        await waitUntil(() => received === sent, 30000, `${sent} sustained receipts`);
+        const finished = performance.now(), bytes = sent * size;
+        const profile = statsDelta(sessionA.performanceDiagnostics(), profileBefore);
+        await publisher.undeclare(); await sub.undeclare();
+        return `${(bytes / 1048576).toFixed(1)} MiB · ${sent} × 32 KiB · sender ${mibPerSecond(bytes, sentAt - started).toFixed(1)} MiB/s · end-to-end ${mibPerSecond(bytes, finished - started).toFixed(1)} MiB/s · JS→WASM copy ${profile.copyMs.toFixed(1)} ms (${(100 * profile.copyMs / (sentAt - started)).toFixed(1)}% of send interval)`;
+    });
+    if (stopAfterBenchmarks) {
+        await sessionA.close(); await sessionB.close();
+        summary.textContent = `${passed}/${total} tests passed; benchmark run complete`;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({status: "BENCHMARK_FINAL", passed, total})}).catch(() => {});
+        run.disabled = false;
+        return;
+    }
+    await check("Automatic reconnect after zenohd restart", async () => {
+        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/reconnect", box.callback);
+        await restartRouter("stop"); await sleep(750); await restartRouter("start");
+        const deadline = Date.now() + 20000; let attempt = 0;
+        while (Date.now() < deadline) {
+            try {
+                await sessionA.put("test/browser/reconnect", encoder.encode(`reconnected-${attempt++}`));
+                const sample = await box.next(1500);
+                if (decoder.decode(sample.payload).startsWith("reconnected-")) { await sub.undeclare(); return `${attempt} send attempt(s)`; }
+            } catch (_) { await sleep(300); }
+        }
+        throw new Error("sessions did not recover within 20 seconds");
+    });
+    await check("Graceful and idempotent shutdown", async () => {
+        await sessionA.close(); await sessionA.close(); await sessionB.close(); await sessionB.close();
+        return "Both sessions closed twice without error";
+    });
+
+    summary.textContent = `${passed}/${total} tests passed`;
+    summary.className = passed === total ? "pass" : "fail";
+    document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} Zenoh browser tests`;
+    fetch("/control/report", {method: "POST", body: JSON.stringify({status: "FINAL", passed, total})}).catch(() => {});
+    run.disabled = false;
+}
+run.onclick = runAll;
+runAll();
+</script>
