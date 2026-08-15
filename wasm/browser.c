@@ -9,8 +9,6 @@ static bool session_open = false;
 static z_owned_subscriber_t subscriber;
 static bool subscriber_open = false;
 
-void _z_webtransport_transport_set_nonblocking(bool enabled);
-
 EM_JS(void, zenoh_pico_deliver_video_frame, (const uint8_t *data, size_t len), {
     if (Module.onZenohVideoFrame) Module.onZenohVideoFrame(HEAPU8.slice(data, data + len));
 });
@@ -27,7 +25,6 @@ static void video_sample_handler(z_loaned_sample_t *sample, void *context) {
 EMSCRIPTEN_KEEPALIVE
 int zenoh_pico_browser_open(const char *endpoint) {
     if (session_open) return 0;
-    _z_webtransport_transport_set_nonblocking(false);
     z_owned_config_t config;
     z_config_default(&config);
     if (zp_config_insert(z_loan_mut(config), Z_CONFIG_MODE_KEY, "client") < 0 ||
@@ -37,7 +34,6 @@ int zenoh_pico_browser_open(const char *endpoint) {
     }
     int result = z_open(&session, z_move(config), NULL);
     session_open = result >= 0;
-    if (session_open) _z_webtransport_transport_set_nonblocking(true);
     return result;
 }
 

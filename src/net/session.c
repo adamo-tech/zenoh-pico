@@ -583,24 +583,10 @@ _z_fut_fn_result_t _z_client_reopen_task_fn(void *ztc_arg, _z_executor_t *execut
         }
     }
 
+    // _z_new_peer() has already rebuilt declarations and interests from the
+    // current session state. Cached messages contain peer-scoped wire-expression
+    // IDs from the previous face and must never be replayed on this connection.
     tc->_tasks = tasks_handles;
-    if (!_z_network_message_slist_is_empty(s->_declaration_cache)) {
-        _z_network_message_slist_t *iter = s->_declaration_cache;
-        while (iter != NULL) {
-            _z_network_message_t *n_msg = _z_network_message_slist_value(iter);
-            ret = _z_send_n_msg(s, n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, NULL);
-            if (ret != _Z_RES_OK) {
-                _Z_DEBUG("Send message during reopen failed: %i", ret);
-                _z_transport_clear(&s->_tp);
-                tc->_session = _z_session_rc_clone_as_weak(&zs);
-                tc->_state = _Z_TRANSPORT_STATE_RECONNECTING;
-                _z_session_rc_drop(&zs);
-                return _z_fut_fn_result_continue();
-            }
-
-            iter = _z_network_message_slist_next(iter);
-        }
-    }
     _z_session_rc_drop(&zs);
     _Z_DEBUG("Reconnected successfully");
     // Resume all sibling tasks that suspended themselves while waiting for reconnection.

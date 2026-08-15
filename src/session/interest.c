@@ -72,7 +72,10 @@ static z_result_t _z_interest_send_decl_subscriber(_z_session_t *zn, uint32_t in
         // Check if key is concerned
         if (restr_key == NULL || _z_keyexpr_intersects(restr_key, &_Z_RC_IN_VAL(sub)->_key._inner)) {
             // Build the declare message to send on the wire
-            _z_wireexpr_t wireexpr = _z_declared_keyexpr_alias_to_wire(&_Z_RC_IN_VAL(sub)->_key, zn);
+            // A peer may receive this replay over a different reliable stream than the
+            // resource declarations above. Keep reconnect replay self-contained instead
+            // of depending on cross-stream ordering of a scoped wire expression.
+            _z_wireexpr_t wireexpr = _z_keyexpr_alias_to_wire(&_Z_RC_IN_VAL(sub)->_key._inner);
             _z_declaration_t declaration = _z_make_decl_subscriber(&wireexpr, _Z_RC_IN_VAL(sub)->_id);
             _z_network_message_t n_msg;
             _z_n_msg_make_declare(&n_msg, declaration, _z_optional_id_make_some(interest_id));
@@ -111,7 +114,7 @@ static z_result_t _z_interest_send_decl_queryable(_z_session_t *zn, uint32_t int
         // Check if key is concerned
         if (restr_key == NULL || _z_keyexpr_intersects(restr_key, &_Z_RC_IN_VAL(qle)->_key._inner)) {
             // Build the declare message to send on the wire
-            _z_wireexpr_t wireexpr = _z_declared_keyexpr_alias_to_wire(&_Z_RC_IN_VAL(qle)->_key, zn);
+            _z_wireexpr_t wireexpr = _z_keyexpr_alias_to_wire(&_Z_RC_IN_VAL(qle)->_key._inner);
             _z_declaration_t declaration = _z_make_decl_queryable(
                 &wireexpr, _Z_RC_IN_VAL(qle)->_id, _Z_RC_IN_VAL(qle)->_complete, _Z_QUERYABLE_DISTANCE_DEFAULT);
             _z_network_message_t n_msg;
@@ -153,7 +156,7 @@ static z_result_t _z_interest_send_decl_token(_z_session_t *zn, uint32_t interes
             _z_keyexpr_intersects(restr_key, &_z_declared_keyexpr_intmap_iterator_value(&iter)->_inner)) {
             // Build the declare message to send on the wire
             _z_wireexpr_t wireexpr =
-                _z_declared_keyexpr_alias_to_wire(_z_declared_keyexpr_intmap_iterator_value(&iter), zn);
+                _z_keyexpr_alias_to_wire(&_z_declared_keyexpr_intmap_iterator_value(&iter)->_inner);
             _z_declaration_t declaration = _z_make_decl_token(&wireexpr, id);
             _z_network_message_t n_msg;
             _z_n_msg_make_declare(&n_msg, declaration, _z_optional_id_make_some(interest_id));
@@ -197,6 +200,34 @@ z_result_t _z_interest_push_declarations_to_peer(_z_session_t *zn, void *peer) {
     _Z_RETURN_IF_ERR(_z_interest_send_decl_queryable(zn, 0, peer, NULL));
     _Z_RETURN_IF_ERR(_z_interest_send_decl_token(zn, 0, peer, NULL));
     _Z_RETURN_IF_ERR(_z_interest_send_declare_final(zn, 0, peer));
+    return _Z_RES_OK;
+}
+
+z_result_t _z_interest_push_interests_to_peer(_z_session_t *zn, void *peer) {
+    _Z_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn));
+    _z_session_interest_rc_slist_t *intrs = _z_session_interest_rc_slist_clone(zn->_local_interests);
+    _z_session_mutex_unlock(zn);
+
+    _z_session_interest_rc_slist_t *xs = intrs;
+    while (xs != NULL) {
+        _z_session_interest_t *intr = _Z_RC_IN_VAL(_z_session_interest_rc_slist_value(xs));
+        // Rebuild the message from the canonical session state. The declaration cache
+        // contains the wire expression used by the previous peer and is not valid for
+        // a newly established face.
+        _z_wireexpr_t wireexpr = _z_keyexpr_alias_to_wire(&intr->_key);
+        _z_interest_t interest = _z_make_interest(&wireexpr, intr->_id, intr->_flags);
+        _z_network_message_t n_msg;
+        _z_n_msg_make_interest(&n_msg, interest);
+        z_result_t ret =
+            _z_send_n_msg(zn, &n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, peer);
+        _z_n_msg_clear(&n_msg);
+        if (ret != _Z_RES_OK) {
+            _z_session_interest_rc_slist_free(&intrs);
+            _Z_ERROR_RETURN(_Z_ERR_TRANSPORT_TX_FAILED);
+        }
+        xs = _z_session_interest_rc_slist_next(xs);
+    }
+    _z_session_interest_rc_slist_free(&intrs);
     return _Z_RES_OK;
 }
 
