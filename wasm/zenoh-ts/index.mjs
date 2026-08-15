@@ -73,7 +73,11 @@ async function createBinding(options) {
     const performanceStats = {allocMs: 0, copyMs: 0, wasmCallMs: 0, byteCalls: 0, bytesCopied: 0};
     let transportWake = () => {};
     const module = await createZenohPicoModule({
-        locateFile: options.locateFile ?? (path => new URL(path, import.meta.url).href),
+        // Leave the default unset so bundlers can rewrite Emscripten's static
+        // `new URL("zenoh-pico.wasm", import.meta.url)` reference to a hashed
+        // production asset. A dynamic fallback here defeats that rewrite and
+        // makes SPA hosts return index.html for the missing unhashed URL.
+        locateFile: options.locateFile,
         zenohPicoReceiveBufferBytes: options.receiveBufferBytes,
         print: options.print,
         printErr: options.printErr,
