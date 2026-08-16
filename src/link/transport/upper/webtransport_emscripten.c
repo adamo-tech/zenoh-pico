@@ -29,6 +29,9 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
                 throw new TypeError('WebTransport URL resolver must return an https:// URL');
             }
         }
+        if (Module.onZenohDiagnostic) {
+            Module.onZenohDiagnostic({type: 'webtransport', event: 'open-start', endpoint});
+        }
         const options = {};
         const hashBase64 = Module.zenohPicoServerCertificateHash;
         if (hashBase64) {
@@ -61,10 +64,14 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
             dataSignal: null,
             dataSignalResolve: null,
             maxIncomingBytes: Math.max(65536, Module.zenohPicoReceiveBufferBytes || 8 * 1024 * 1024),
+            writeTimeoutMs: timeout_ms,
             spaceSignal: null,
             spaceSignalResolve: null,
             stats: {readCalls: 0, readBytes: 0, writeCalls: 0, writeBytes: 0},
         });
+        if (Module.onZenohDiagnostic) {
+            Module.onZenohDiagnostic({type: 'webtransport', event: 'open-ready', handle});
+        }
         return handle;
     } catch (error) {
         // A failed resolver or handshake must not leave a transport or a
@@ -73,6 +80,9 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
             try { transport.close(); } catch (_) {}
         }
         if (Module.printErr) Module.printErr('WebTransport open failed: ' + String(error));
+        if (Module.onZenohDiagnostic) {
+            Module.onZenohDiagnostic({type: 'webtransport', event: 'open-failed', error: String(error)});
+        }
         return -1;
     } finally {
         if (timeoutId !== null) clearTimeout(timeoutId);
@@ -122,6 +132,12 @@ EM_JS(int, _zp_webtransport_js_read_nonblocking, (int handle, uint8_t *dst, size
     // non-blocking read has no data available yet.
     if (!link) return 0;
     if (link.incomingBytes === 0) return link.closed ? 0 : -1;
+    if (len === 0 && Module.onZenohDiagnostic) {
+        Module.onZenohDiagnostic({
+            type: 'webtransport', event: 'zero-length-read', handle,
+            queuedBytes: link.incomingBytes, stats: {...link.stats},
+        });
+    }
     const wanted = Math.min(len, link.incomingBytes);
     let copied = 0;
     while (copied < wanted) {
@@ -150,6 +166,7 @@ EM_JS(int, _zp_webtransport_js_read_nonblocking, (int handle, uint8_t *dst, size
 EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, size_t len), {
     const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
     if (!link) return -1;
+    let timeoutId = null;
     try {
         if (!link.writer) {
             const stream = await link.streamPromise;
@@ -165,7 +182,15 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
                             await link.spaceSignal;
                         }
                         const result = await link.reader.read();
-                        if (result.done) break;
+                        if (result.done) {
+                            if (Module.onZenohDiagnostic) {
+                                Module.onZenohDiagnostic({
+                                    type: 'webtransport', event: 'read-pump-done', handle,
+                                    stats: {...link.stats}, queuedBytes: link.incomingBytes,
+                                });
+                            }
+                            break;
+                        }
                         if (result.value?.length) {
                             link.incoming.push(result.value);
                             link.incomingBytes += result.value.length;
@@ -177,8 +202,13 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
                             link.dataSignalResolve = null;
                         }
                     }
-                } catch (_) {
-                    // The transport's closed promise carries the detailed error.
+                } catch (error) {
+                    if (Module.onZenohDiagnostic) {
+                        Module.onZenohDiagnostic({
+                            type: 'webtransport', event: 'read-pump-failed', handle,
+                            error: String(error), stats: {...link.stats}, queuedBytes: link.incomingBytes,
+                        });
+                    }
                 } finally {
                     link.closed = true;
                     if (Module.onZenohTransportData) Module.onZenohTransportData(handle, 0);
@@ -186,7 +216,21 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
                     if (link.spaceSignalResolve) link.spaceSignalResolve();
                 }
             })();
-            link.transport.closed.catch(() => {}).finally(() => {
+            link.transport.closed.then(closeInfo => {
+                if (Module.onZenohDiagnostic) {
+                    Module.onZenohDiagnostic({
+                        type: 'webtransport', event: 'transport-closed', handle, closeInfo,
+                        stats: {...link.stats}, queuedBytes: link.incomingBytes,
+                    });
+                }
+            }, error => {
+                if (Module.onZenohDiagnostic) {
+                    Module.onZenohDiagnostic({
+                        type: 'webtransport', event: 'transport-failed', handle,
+                        error: String(error), stats: {...link.stats}, queuedBytes: link.incomingBytes,
+                    });
+                }
+            }).finally(() => {
                 link.closed = true;
                 if (link.dataSignalResolve) link.dataSignalResolve();
                 if (link.spaceSignalResolve) link.spaceSignalResolve();
@@ -195,8 +239,14 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
         if (link.closed || link.writeError) return -1;
         const bytes = HEAPU8.slice(src, src + len);
         // Await acceptance so Pico never observes a successful reliable write
-        // that the browser has already rejected.
-        await link.writer.write(bytes);
+        // that the browser has already rejected. Safari can leave this promise
+        // pending after the peer disappears, so bound it by the locator timeout.
+        const timeout = new Promise((_, reject) => {
+            timeoutId = setTimeout(
+                () => reject(new Error('WebTransport write timeout')),
+                link.writeTimeoutMs);
+        });
+        await Promise.race([link.writer.write(bytes), timeout]);
         link.stats.writeCalls++;
         link.stats.writeBytes += len;
         return len;
@@ -204,7 +254,12 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
         link.lastError = String(error);
         link.writeError = true;
         link.closed = true;
+        if (Module.onZenohDiagnostic) {
+            Module.onZenohDiagnostic({type: 'webtransport', event: 'write-failed', handle, error: link.lastError});
+        }
         return -1;
+    } finally {
+        if (timeoutId !== null) clearTimeout(timeoutId);
     }
 });
 
@@ -212,17 +267,37 @@ EM_ASYNC_JS(void, _zp_webtransport_js_close, (int handle), {
     const registry = globalThis.__zenohPicoWebTransport;
     const link = registry?.links.get(handle);
     if (!link) return;
-    try {
-        if (link.writer) {
-            await Promise.race([
-                link.writer.close(),
-                new Promise(resolve => setTimeout(resolve, 1000)),
-            ]);
-        }
-    } catch (_) {}
-    if (link.reader) await link.reader.cancel().catch(() => {});
-    try { link.transport.close(); } catch (_) {}
+    if (Module.onZenohDiagnostic) {
+        Module.onZenohDiagnostic({
+            type: 'webtransport', event: 'close-start', handle,
+            stats: {...link.stats}, queuedBytes: link.incomingBytes,
+            writeError: link.writeError, lastError: link.lastError,
+        });
+    }
+    // Safari may leave both stream cleanup promises pending after the peer
+    // disappears. Detach the dead link first and bound all browser cleanup so
+    // Pico's reconnect task can never be held hostage by those promises.
     registry.links.delete(handle);
+    link.closed = true;
+    if (link.dataSignalResolve) link.dataSignalResolve();
+    if (link.spaceSignalResolve) link.spaceSignalResolve();
+    try { link.transport.close(); } catch (_) {}
+    const cleanup = [];
+    try {
+        if (link.writer) cleanup.push(Promise.resolve(link.writer.close()).catch(() => {}));
+    } catch (_) {}
+    try {
+        if (link.reader) cleanup.push(Promise.resolve(link.reader.cancel()).catch(() => {}));
+    } catch (_) {}
+    if (cleanup.length) {
+        await Promise.race([
+            Promise.allSettled(cleanup),
+            new Promise(resolve => setTimeout(resolve, 250)),
+        ]);
+    }
+    if (Module.onZenohDiagnostic) {
+        Module.onZenohDiagnostic({type: 'webtransport', event: 'close-complete', handle});
+    }
 });
 
 z_result_t _z_webtransport_endpoint_init(_z_sys_net_endpoint_t *ep, const _z_string_t *address) {

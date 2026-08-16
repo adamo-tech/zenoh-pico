@@ -41,6 +41,7 @@ emcmake cmake -S "$repo_dir" -B "$build_dir" \
   -DZ_FEATURE_LINK_UDP_UNICAST=0 \
   -DZ_FEATURE_SCOUTING=0 \
   -DBATCH_UNICAST_SIZE=65535 \
+  -DZ_TRANSPORT_LEASE=3000 \
   -DFRAG_MAX_SIZE=16777216
 
 cmake --build "$build_dir" --parallel
@@ -87,7 +88,20 @@ emcc "$repo_dir/wasm/zenoh_ts.c" \
   -sEXPORTED_RUNTIME_METHODS=ccall \
   -o "$repo_dir/dist-wasm/zenoh-ts/zenoh-pico.mjs"
 cp "$repo_dir/wasm/zenoh-ts/index.mjs" "$repo_dir/dist-wasm/zenoh-ts/index.mjs"
+if command -v shasum >/dev/null 2>&1; then
+  module_build_id="$(shasum -a 256 "$repo_dir/dist-wasm/zenoh-ts/zenoh-pico.mjs" | cut -d' ' -f1)"
+  wasm_build_id="$(shasum -a 256 "$repo_dir/dist-wasm/zenoh-ts/zenoh-pico.wasm" | cut -d' ' -f1)"
+else
+  module_build_id="$(sha256sum "$repo_dir/dist-wasm/zenoh-ts/zenoh-pico.mjs" | cut -d' ' -f1)"
+  wasm_build_id="$(sha256sum "$repo_dir/dist-wasm/zenoh-ts/zenoh-pico.wasm" | cut -d' ' -f1)"
+fi
+sed \
+  -e "s|\"./zenoh-pico.mjs\"|\"./zenoh-pico.mjs?v=$module_build_id\"|" \
+  -e "s|locateFile: options.locateFile,|locateFile: options.locateFile ?? (path => path === \"zenoh-pico.wasm\" ? new URL(\"./zenoh-pico.wasm?v=$wasm_build_id\", import.meta.url).href : path),|" \
+  "$repo_dir/wasm/zenoh-ts/index.mjs" > "$repo_dir/dist-wasm/zenoh-ts/browser-index.mjs"
 cp "$repo_dir/wasm/zenoh-ts/index.d.ts" "$repo_dir/dist-wasm/zenoh-ts/index.d.ts"
 cp "$repo_dir/wasm/zenoh-ts/e2e.html" "$repo_dir/dist-wasm/zenoh-ts/e2e.html"
 cp "$repo_dir/wasm/zenoh-ts/browser-tests.html" "$repo_dir/dist-wasm/zenoh-ts/browser-tests.html"
+cp "$repo_dir/wasm/zenoh-ts/chaos-tests.html" "$repo_dir/dist-wasm/zenoh-ts/chaos-tests.html"
+cp "$repo_dir/wasm/zenoh-ts/hosted-auth-tests.html" "$repo_dir/dist-wasm/zenoh-ts/hosted-auth-tests.html"
 cp "$repo_dir/wasm/zenoh-ts/package.json" "$repo_dir/dist-wasm/zenoh-ts/package.json"

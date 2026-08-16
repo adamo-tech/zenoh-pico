@@ -251,6 +251,17 @@ export class PicoSession {
         return this.runtime.performanceStats();
     }
 
+    memoryDiagnostics() {
+        return this.runtime.module.getZenohMemoryStats?.() ?? {};
+    }
+
+    forceReconnect(reason = "application watchdog requested reconnect") {
+        if (this.closed) return false;
+        const interrupted = this.runtime.module.forceZenohTransportReconnect?.(reason) ?? 0;
+        this.requestPoll();
+        return interrupted > 0;
+    }
+
     async delete(keyExpr, options = {}) {
         const qos = qosArguments(options);
         const timestamp = timestampArguments(options);

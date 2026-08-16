@@ -46,7 +46,14 @@ static z_result_t _z_unicast_transport_create_inner(_z_transport_unicast_t *ztu,
     // Initialize the read and write buffers
     uint16_t mtu = (zl->_mtu < param->_batch_size) ? zl->_mtu : param->_batch_size;
     size_t wbuf_size = mtu;
+    // A streamed link carries the negotiated batch payload behind a two-byte
+    // length prefix. Keep room for both: otherwise a maximum-sized batch fills
+    // the receive buffer with two payload bytes still outstanding, and the next
+    // socket read is incorrectly issued with a zero-length destination.
     size_t zbuf_size = param->_batch_size;
+    if (zl->_cap._flow == Z_LINK_CAP_FLOW_STREAM) {
+        zbuf_size += _Z_MSG_LEN_ENC_SIZE;
+    }
     // Initialize tx rx buffers
     ztu->_common._wbuf = _z_wbuf_make(wbuf_size, false);
     ztu->_common._zbuf = _z_zbuf_make(zbuf_size);

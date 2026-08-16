@@ -1,0 +1,201 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zenoh-Pico hosted authorization tests</title>
+<style>
+body { font: 15px system-ui; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; color: #18202a; }
+h1 { margin-bottom: .25rem; }
+form { display: flex; gap: .6rem; margin: 1rem 0; }
+input { flex: 1; padding: .65rem; font: inherit; }
+button { padding: .65rem 1rem; font: inherit; }
+#summary { font-size: 1.1rem; margin: 1rem 0; padding: 1rem; border-radius: .5rem; background: #eef2f6; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: .65rem; border-bottom: 1px solid #d9dee5; text-align: left; vertical-align: top; }
+.running { color: #7a5b00; } .pass { color: #087830; } .fail { color: #b00020; font-weight: 650; }
+pre { white-space: pre-wrap; font-size: 12px; margin: .3rem 0 0; }
+</style>
+<h1>Zenoh-Pico hosted authorization tests</h1>
+<p>Real browser → signed single-use ticket → dev WebTransport relay. Secrets are held only for this run and never logged.</p>
+<form id="credentials">
+  <input id="apiKey" type="password" autocomplete="off" placeholder="Dev API key" required>
+  <button id="run">Run authorization tests</button>
+</form>
+<div id="summary">Ready.</div>
+<table><thead><tr><th>Gate</th><th>Result</th><th>Details</th></tr></thead><tbody id="results"></tbody></table>
+<script type="module">
+const {createZenohPico} = await import(`./browser-index.mjs?v=${Date.now()}`);
+const apiUrl = "https://api-dev.adamohq.com";
+const endpoint = "webtransport/wt-dev.adamohq.com:443/zenoh#tout=10000";
+const encoder = new TextEncoder();
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const rows = [];
+
+function errorText(error) {
+  return (error?.stack || error?.message || String(error)).slice(0, 1200);
+}
+async function check(name, action) {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td>${name}</td><td class="running">RUNNING</td><td><pre></pre></td>`;
+  results.append(tr); rows.push(tr);
+  const started = performance.now();
+  try {
+    const detail = await action();
+    tr.children[1].textContent = "PASS"; tr.children[1].className = "pass";
+    tr.querySelector("pre").textContent = `${detail ?? ""} (${(performance.now() - started).toFixed(0)} ms)`;
+    return true;
+  } catch (error) {
+    tr.children[1].textContent = "FAIL"; tr.children[1].className = "fail";
+    tr.querySelector("pre").textContent = errorText(error);
+    return false;
+  }
+}
+async function exchange(apiKey) {
+  const response = await fetch(`${apiUrl}/api/keys/token`, {method: "POST", headers: {"X-API-Key": apiKey}});
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`API key exchange failed (${response.status})`);
+  if (!body.token || !body.org_id || !body.org_slug) throw new Error("API key exchange returned incomplete identity");
+  return body;
+}
+async function ticket(identity, orgId = identity.org_id) {
+  const response = await fetch(`${apiUrl}/api/zenoh/webtransport-ticket`, {
+    method: "POST",
+    headers: {authorization: `Bearer ${identity.token}`, "content-type": "application/json"},
+    body: JSON.stringify({org_id: orgId}),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`ticket request failed (${response.status}): ${body.message || body.error || "rejected"}`);
+  const url = new URL(body.endpoint);
+  url.searchParams.set("ticket", body.ticket);
+  return url.toString();
+}
+async function open(runtime, identity) {
+  return runtime.open(endpoint, {resolveWebTransportUrl: () => ticket(identity)});
+}
+function inbox() {
+  const queued = [], waiters = [];
+  return {
+    callback(value) { const waiter = waiters.shift(); waiter ? waiter(value) : queued.push(value); },
+    next(timeoutMs = 3000) {
+      if (queued.length) return Promise.resolve(queued.shift());
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("sample delivery timeout")), timeoutMs);
+        waiters.push(value => { clearTimeout(timer); resolve(value); });
+      });
+    },
+  };
+}
+async function expectNoSample(box, timeoutMs = 500) {
+  try { await box.next(timeoutMs); }
+  catch (error) {
+    if (error?.message === "sample delivery timeout") return;
+    throw error;
+  }
+  throw new Error("unauthorized sample crossed the relay");
+}
+
+credentials.addEventListener("submit", async event => {
+  event.preventDefault(); run.disabled = true; results.replaceChildren(); rows.length = 0;
+  summary.textContent = "Running…"; summary.className = "running";
+  const suppliedKey = apiKey.value;
+  apiKey.value = "";
+  let identity, sender, receiver;
+  try {
+    identity = await exchange(suppliedKey);
+  } catch (error) {
+    summary.textContent = `Authentication failed: ${error.message}`; summary.className = "fail"; run.disabled = false; return;
+  }
+  // Drop the API key as soon as it has been exchanged. Tickets use only the short-lived JWT.
+  const own = `adamo/${identity.org_slug}/_pico_auth/${crypto.randomUUID()}`;
+  const other = `adamo/auth-canary-other/_pico_auth/${crypto.randomUUID()}`;
+  let passed = 0, total = 0;
+  const gate = async (name, action) => { total++; if (await check(name, action)) passed++; };
+  try {
+    await gate("Ticket identity opens two browser sessions", async () => {
+      const [a, b] = await Promise.all([createZenohPico(), createZenohPico()]);
+      [sender, receiver] = await Promise.all([open(a, identity), open(b, identity)]);
+      return `two independently ticketed sessions opened for ${identity.org_slug}`;
+    });
+    await gate("Own-organization publish and subscribe", async () => {
+      const box = inbox(); const sub = await receiver.declareSubscriber(own, box.callback);
+      try {
+        await sleep(100);
+        const expected = encoder.encode("authorized-browser-datapath");
+        await sender.put(own, expected);
+        const actual = (await box.next()).payload;
+        if (actual.length !== expected.length || actual.some((v, i) => v !== expected[i])) throw new Error("payload mismatch");
+        return "byte-exact payload crossed the relay within the ticket organization";
+      } finally { await sub.undeclare(); }
+    });
+    await gate("Cross-organization pub/sub data path", async () => {
+      const box = inbox(); const sub = await receiver.declareSubscriber(other, box.callback);
+      await sleep(100); await sender.put(other, encoder.encode("must-not-cross"));
+      await expectNoSample(box);
+      // A filtered declaration has no router-side ID. Let session teardown
+      // release the local handle instead of sending an invalid undeclaration.
+      void sub;
+      return "router silently filtered the unauthorized subscription/publication path";
+    });
+    await gate("Cross-organization query data path", async () => {
+      let queries = 0;
+      const queryable = await receiver.declareQueryable(other, async query => {
+        queries++; await query.reply(encoder.encode("must-not-cross"));
+      });
+      const replies = [];
+      for await (const reply of await sender.get(other, {timeoutMs: 300})) {
+        if (reply.isOk()) replies.push(reply.result());
+      }
+      if (queries || replies.length) throw new Error(`${queries} unauthorized queries and ${replies.length} replies crossed the relay`);
+      void queryable;
+      return "queryable, query and reply path remained isolated";
+    });
+    await gate("Cross-organization liveliness data path", async () => {
+      const box = inbox();
+      const sub = await receiver.liveliness().declareSubscriber(other, box.callback, {history: true});
+      const token = await sender.liveliness().declareToken(other);
+      await expectNoSample(box);
+      void token; void sub;
+      return "unauthorized liveliness token was not observable";
+    });
+    await gate("Global tenant wildcard", async () => {
+      const box = inbox(); const sub = await receiver.declareSubscriber("adamo/**", box.callback);
+      await sleep(100); await sender.put(own, encoder.encode("authorized-own-write"));
+      await expectNoSample(box);
+      void sub;
+      return "global wildcard could not observe an otherwise-authorized tenant write";
+    });
+    await gate("Reserved system namespace", async () => {
+      const key = `system/control/${crypto.randomUUID()}`;
+      const box = inbox(); const sub = await receiver.declareSubscriber(key, box.callback);
+      await sleep(100); await sender.put(key, encoder.encode("must-not-cross"));
+      await expectNoSample(box);
+      void sub;
+      return "reserved namespace publication remained invisible";
+    });
+    await gate("Ticket cannot select another organization", async () => {
+      try { await ticket(identity, crypto.randomUUID()); }
+      catch (error) { return `API rejected org substitution (${error.message})`; }
+      throw new Error("ticket issuer accepted an organization outside the authenticated identity");
+    });
+    await gate("Single-use ticket replay", async () => {
+      const once = await ticket(identity);
+      const [a, b] = await Promise.all([createZenohPico(), createZenohPico()]);
+      const first = await a.open(endpoint, {resolveWebTransportUrl: () => once});
+      try {
+        try {
+          const replay = await b.open(endpoint, {resolveWebTransportUrl: () => once});
+          await replay.close();
+        } catch (error) {
+          return `second use rejected (${error?.message || error})`;
+        }
+        throw new Error("relay accepted a replayed ticket");
+      } finally { await first.close(); }
+    });
+  } finally {
+    await Promise.allSettled([sender?.close(), receiver?.close()]);
+  }
+  summary.textContent = `${passed}/${total} authorization gates passed`;
+  summary.className = passed === total ? "pass" : "fail";
+  document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} hosted authorization gates`;
+  run.disabled = false;
+});
+</script>

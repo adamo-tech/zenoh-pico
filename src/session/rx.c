@@ -85,7 +85,34 @@ static z_result_t _z_handle_declare_inner(_z_session_t *zn, _z_n_msg_declare_t *
 }
 
 static z_result_t _z_handle_declare(_z_session_t *zn, _z_n_msg_declare_t *decl, _z_transport_peer_common_t *peer) {
+    const unsigned int declaration_tag = (unsigned int)decl->_decl._tag;
+    uint16_t wire_scope = Z_RESOURCE_ID_NONE;
+    uintptr_t wire_mapping = 0;
+    switch (decl->_decl._tag) {
+        case _Z_DECL_KEXPR:
+            wire_scope = decl->_decl._body._decl_kexpr._keyexpr._id;
+            wire_mapping = decl->_decl._body._decl_kexpr._keyexpr._mapping;
+            break;
+        case _Z_DECL_SUBSCRIBER:
+            wire_scope = decl->_decl._body._decl_subscriber._keyexpr._id;
+            wire_mapping = decl->_decl._body._decl_subscriber._keyexpr._mapping;
+            break;
+        case _Z_DECL_QUERYABLE:
+            wire_scope = decl->_decl._body._decl_queryable._keyexpr._id;
+            wire_mapping = decl->_decl._body._decl_queryable._keyexpr._mapping;
+            break;
+        case _Z_DECL_TOKEN:
+            wire_scope = decl->_decl._body._decl_token._keyexpr._id;
+            wire_mapping = decl->_decl._body._decl_token._keyexpr._mapping;
+            break;
+        default:
+            break;
+    }
     z_result_t ret = _z_handle_declare_inner(zn, decl, peer);
+    if (ret != _Z_RES_OK) {
+        _Z_ERROR("Declaration tag %u failed with error %d (scope: %u, mapping: %zu)", declaration_tag, (int)ret,
+                 (unsigned int)wire_scope, (size_t)wire_mapping);
+    }
     _z_n_msg_declare_clear(decl);
     return ret;
 }
@@ -177,6 +204,29 @@ static z_result_t _z_handle_response(_z_session_t *zn, _z_n_msg_response_t *resp
 z_result_t _z_handle_network_message(_z_transport_common_t *transport, _z_zenoh_message_t *msg,
                                      _z_transport_peer_common_t *peer) {
     z_result_t ret = _Z_RES_OK;
+    const uint8_t network_tag = msg->_tag;
+    uint16_t wire_scope = Z_RESOURCE_ID_NONE;
+    uintptr_t wire_mapping = 0;
+    switch (network_tag) {
+        case _Z_N_PUSH:
+            wire_scope = msg->_body._push._key._id;
+            wire_mapping = msg->_body._push._key._mapping;
+            break;
+        case _Z_N_REQUEST:
+            wire_scope = msg->_body._request._key._id;
+            wire_mapping = msg->_body._request._key._mapping;
+            break;
+        case _Z_N_RESPONSE:
+            wire_scope = msg->_body._response._key._id;
+            wire_mapping = msg->_body._response._key._mapping;
+            break;
+        case _Z_N_INTEREST:
+            wire_scope = msg->_body._interest._interest._keyexpr._id;
+            wire_mapping = msg->_body._interest._interest._keyexpr._mapping;
+            break;
+        default:
+            break;
+    }
     _z_session_t *zn = _z_transport_common_get_session(transport);
 
     switch (msg->_tag) {
@@ -227,6 +277,10 @@ z_result_t _z_handle_network_message(_z_transport_common_t *transport, _z_zenoh_
             _Z_ERROR("Unknown network message ID");
             _z_n_msg_clear(msg);
             break;
+    }
+    if (ret != _Z_RES_OK) {
+        _Z_ERROR("Network message tag %u failed with error %d (scope: %u, mapping: %zu)",
+                 (unsigned int)network_tag, (int)ret, (unsigned int)wire_scope, (size_t)wire_mapping);
     }
     return ret;
 }

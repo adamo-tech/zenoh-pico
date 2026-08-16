@@ -15,13 +15,16 @@ button { padding: .7rem 1rem; font: inherit; }
 <h1>Zenoh-Pico WebTransport browser tests</h1>
 <p>Real browser → WebTransport → zenohd tests. The reconnect case deliberately restarts zenohd.</p>
 <button id="run">Run all tests</button>
+<button id="reconnect">Run reconnect only</button>
+<button id="scopeChurn">Run scope churn only</button>
 <div id="summary">Ready.</div>
 <table><thead><tr><th>Feature</th><th>Result</th><th>Details</th></tr></thead><tbody id="results"></tbody></table>
 <h2>Benchmarks</h2>
 <table><thead><tr><th>Benchmark</th><th>Result</th><th>Measurements</th></tr></thead><tbody id="benchmarks"></tbody></table>
 <script type="module">
-import {createZenohPico, SampleKind, Priority, CongestionControl, Reliability, PicoTimestamp,
-    QueryTarget, ConsolidationMode, ReplyKeyExpr, PicoReplyError} from "./index.mjs";
+const {createZenohPico, SampleKind, Priority, CongestionControl, Reliability, PicoTimestamp,
+    QueryTarget, ConsolidationMode, ReplyKeyExpr, PicoReplyError} =
+    await import(`./browser-index.mjs?v=${Date.now()}`);
 
 const endpoint = "webtransport/127.0.0.1:7448/zenoh#tout=3000";
 const certificateHash = "nYssBVdaYdbVnmBjLeFKA2ZCroIMlXzn3CTN6kmRUP0=";
@@ -32,6 +35,8 @@ const stopAfterTimestamp = query.has("stopAfterTimestamp");
 const stopAfterLivelinessGet = query.has("stopAfterLivelinessGet");
 const stopAfterSessionGet = query.has("stopAfterSessionGet");
 const stopAfterBenchmarks = query.has("stopAfterBenchmarks");
+let onlyReconnect = query.has("onlyReconnect");
+let onlyScopeChurn = query.has("onlyScopeChurn");
 const rows = new Map();
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -128,8 +133,66 @@ async function restartRouter(action) {
     if (!response.ok) throw new Error(await response.text());
 }
 
+async function reconnectTest(sessionA, sessionB) {
+    const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/reconnect", box.callback);
+    try {
+        await restartRouter("stop"); await sleep(750); await restartRouter("start");
+        const deadline = Date.now() + 5000; let attempt = 0;
+        while (Date.now() < deadline) {
+            try {
+                await sessionA.put("test/browser/reconnect", encoder.encode(`reconnected-${attempt++}`));
+                const sample = await box.next(1500);
+                if (decoder.decode(sample.payload).startsWith("reconnected-")) return `${attempt} send attempt(s)`;
+            } catch (_) { await sleep(300); }
+        }
+        throw new Error(`sessions did not recover within 5 seconds\n${transportDiagnostics(sessionA, sessionB)}`);
+    } finally {
+        await sub.undeclare().catch(() => {});
+    }
+}
+
+async function scopeLifetimeChurnTest(sessionA, sessionB) {
+    const prefix = `test/browser/scope-churn/${Date.now()}`;
+    let completeSamples = 0;
+    let markerReceived = false;
+    const subscriber = await sessionB.declareSubscriber(`${prefix}/**`, sample => {
+        completeSamples++;
+        if (sample.keyExpr === `${prefix}/marker`) markerReceived = true;
+    });
+    const payload = new Uint8Array(32 * 1024);
+    const errorsBefore = wasmDiagnostics.filter(item => String(item.message || item.error || "").includes("-109")).length;
+    try {
+        await sleep(100);
+        for (let resource = 0; resource < 128; resource++) {
+            const publisher = await sessionA.declarePublisher(`${prefix}/resource-${resource}`, {
+                priority: Priority.REAL_TIME,
+                congestionControl: CongestionControl.DROP,
+                reliability: Reliability.BEST_EFFORT,
+            });
+            for (let sample = 0; sample < 8; sample++) {
+                new DataView(payload.buffer).setUint32(0, resource * 8 + sample, true);
+                await publisher.put(payload);
+            }
+            await publisher.undeclare();
+        }
+        const deadline = performance.now() + 5000;
+        while (!markerReceived && performance.now() < deadline) {
+            await sessionA.put(`${prefix}/marker`, Uint8Array.of(1));
+            await sleep(50);
+        }
+        if (!markerReceived) throw new Error(`session wedged after scope churn\n${transportDiagnostics(sessionA, sessionB)}`);
+        const errorsAfter = wasmDiagnostics.filter(item => String(item.message || item.error || "").includes("-109")).length;
+        if (errorsAfter !== errorsBefore) {
+            throw new Error(`scope churn produced ${errorsAfter - errorsBefore} new -109 error(s)\n${transportDiagnostics(sessionA, sessionB)}`);
+        }
+        return `128 declared scopes × 8 real-time samples; ${completeSamples} complete samples and post-churn marker received`;
+    } finally {
+        await subscriber.undeclare().catch(() => {});
+    }
+}
+
 async function runAll() {
-    run.disabled = true; results.replaceChildren(); benchmarks.replaceChildren(); rows.clear();
+    run.disabled = reconnect.disabled = scopeChurn.disabled = true; results.replaceChildren(); benchmarks.replaceChildren(); rows.clear();
     summary.textContent = "Running…";
     let passed = 0, total = 0;
     const check = async (name, fn) => {
@@ -157,11 +220,15 @@ async function runAll() {
                 recordDiagnostic({type: "stdout", message});
             },
         });
-        return `Modular package initialized and ABI check accepted; receive buffer ${configuredReceiveBufferBytes} B`;
+        const wasmUrl = performance.getEntriesByType("resource")
+            .map(entry => entry.name)
+            .find(name => name.includes("zenoh-pico.wasm"));
+        if (!wasmUrl) throw new Error("WASM resource URL was not recorded by the browser");
+        return `Modular package initialized and ABI check accepted; receive buffer ${configuredReceiveBufferBytes} B; artifact ${new URL(wasmUrl).searchParams.get("v") ?? "unversioned"}`;
     });
     if (!runtimeReady) {
         summary.textContent = `${passed}/${total} prerequisite tests passed; stopped before opening sessions`;
-        run.disabled = false;
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
         return;
     }
     await check("Certificate hash rejection", async () => {
@@ -177,7 +244,7 @@ async function runAll() {
         await sessionA?.close().catch(() => {});
         await sessionB?.close().catch(() => {});
         summary.textContent = `${passed}/${total} prerequisite tests passed; stopped because sessions did not open`;
-        run.disabled = false;
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
         fetch("/control/report", {method: "POST", body: JSON.stringify({
             status: "FINAL", passed, total, stopped: "session-open",
         })}).catch(() => {});
@@ -190,6 +257,29 @@ async function runAll() {
         if (a === b) throw new Error(`independent sessions unexpectedly share zid ${a}`);
         return `Distinct 128-bit Zenoh IDs reported (${a}, ${b})`;
     });
+    if (onlyReconnect) {
+        await check("Automatic reconnect after zenohd restart", () => reconnectTest(sessionA, sessionB));
+        await check("Graceful and idempotent shutdown", async () => {
+            await sessionA.close(); await sessionA.close(); await sessionB.close(); await sessionB.close();
+            return "Both sessions closed twice without error";
+        });
+        summary.textContent = `${passed}/${total} reconnect tests passed`;
+        summary.className = passed === total ? "pass" : "fail";
+        document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} reconnect tests`;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({status: "RECONNECT_FINAL", passed, total})}).catch(() => {});
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
+        return;
+    }
+    if (onlyScopeChurn) {
+        await check("Scoped key-expression lifetime under publisher churn", () => scopeLifetimeChurnTest(sessionA, sessionB));
+        await sessionA.close(); await sessionB.close();
+        summary.textContent = `${passed}/${total} scope-churn tests passed`;
+        summary.className = passed === total ? "pass" : "fail";
+        document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} scope-churn tests`;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({status: "SCOPE_CHURN_FINAL", passed, total})}).catch(() => {});
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
+        return;
+    }
     await check("Session put and generic subscriber callback", async () => {
         const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/session", box.callback);
         await sleep(200); const expected = Uint8Array.of(0, 1, 2, 127, 128, 255);
@@ -239,7 +329,7 @@ async function runAll() {
         await sessionA.close(); await sessionB.close();
         summary.textContent = `${passed}/${total} timestamp diagnostic tests passed`;
         fetch("/control/report", {method: "POST", body: JSON.stringify({status: "TIMESTAMP_FINAL", passed, total})}).catch(() => {});
-        run.disabled = false;
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
         return;
     }
     await check("Session get request payload, multiple replies and completion", async () => {
@@ -349,7 +439,7 @@ async function runAll() {
         summary.textContent = `${passed}/${total} session-get diagnostic tests passed`;
         summary.className = passed === total ? "pass" : "fail";
         document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} session-get diagnostic tests`;
-        run.disabled = false;
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
         return;
     }
     await check("Liveliness token PUT and DELETE", async () => {
@@ -434,7 +524,7 @@ async function runAll() {
         summary.textContent = `${passed}/${total} liveliness diagnostic tests passed`;
         summary.className = passed === total ? "pass" : "fail";
         document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} liveliness diagnostic tests`;
-        run.disabled = false;
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
         return;
     }
     await check("Session delete", async () => {
@@ -450,6 +540,7 @@ async function runAll() {
         if (decoder.decode(sample.payload) !== "publisher-ok") throw new Error("publisher payload mismatch");
         await publisher.undeclare(); await sub.undeclare(); return "Declared publisher delivered payload";
     });
+    await check("Scoped key-expression lifetime under publisher churn", () => scopeLifetimeChurnTest(sessionA, sessionB));
     await check("Declared publisher QoS metadata", async () => {
         const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/publisher-qos", box.callback);
         const publisher = await sessionA.declarePublisher("test/browser/publisher-qos", {
@@ -506,7 +597,7 @@ async function runAll() {
         await sessionA.close(); await sessionB.close();
         summary.textContent = `${passed}/${total} diagnostic tests passed`;
         fetch("/control/report", {method: "POST", body: JSON.stringify({status: "DIAGNOSTIC_FINAL", passed, total, configuredReceiveBufferBytes})}).catch(() => {});
-        run.disabled = false;
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
         return;
     }
     await check("Bounded receive-buffer stress", async () => {
@@ -624,22 +715,10 @@ async function runAll() {
         await sessionA.close(); await sessionB.close();
         summary.textContent = `${passed}/${total} tests passed; benchmark run complete`;
         fetch("/control/report", {method: "POST", body: JSON.stringify({status: "BENCHMARK_FINAL", passed, total})}).catch(() => {});
-        run.disabled = false;
+        run.disabled = reconnect.disabled = scopeChurn.disabled = false;
         return;
     }
-    await check("Automatic reconnect after zenohd restart", async () => {
-        const box = inbox(); const sub = await sessionB.declareSubscriber("test/browser/reconnect", box.callback);
-        await restartRouter("stop"); await sleep(750); await restartRouter("start");
-        const deadline = Date.now() + 20000; let attempt = 0;
-        while (Date.now() < deadline) {
-            try {
-                await sessionA.put("test/browser/reconnect", encoder.encode(`reconnected-${attempt++}`));
-                const sample = await box.next(1500);
-                if (decoder.decode(sample.payload).startsWith("reconnected-")) { await sub.undeclare(); return `${attempt} send attempt(s)`; }
-            } catch (_) { await sleep(300); }
-        }
-        throw new Error("sessions did not recover within 20 seconds");
-    });
+    await check("Automatic reconnect after zenohd restart", () => reconnectTest(sessionA, sessionB));
     await check("Graceful and idempotent shutdown", async () => {
         await sessionA.close(); await sessionA.close(); await sessionB.close(); await sessionB.close();
         return "Both sessions closed twice without error";
@@ -649,8 +728,9 @@ async function runAll() {
     summary.className = passed === total ? "pass" : "fail";
     document.title = `${passed === total ? "PASS" : "FAIL"} — ${passed}/${total} Zenoh browser tests`;
     fetch("/control/report", {method: "POST", body: JSON.stringify({status: "FINAL", passed, total})}).catch(() => {});
-    run.disabled = false;
+    run.disabled = reconnect.disabled = scopeChurn.disabled = false;
 }
-run.onclick = runAll;
-runAll();
+run.onclick = () => { onlyReconnect = false; onlyScopeChurn = false; runAll(); };
+reconnect.onclick = () => { onlyReconnect = true; onlyScopeChurn = false; runAll(); };
+scopeChurn.onclick = () => { onlyReconnect = false; onlyScopeChurn = true; runAll(); };
 </script>

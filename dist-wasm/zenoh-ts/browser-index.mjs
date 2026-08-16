@@ -1,4 +1,4 @@
-import createZenohPicoModule from "./zenoh-pico.mjs";
+import createZenohPicoModule from "./zenoh-pico.mjs?v=c11f4b4d59de7a289241f90135551b7d36dd1589aa97f6a60053bf996b5bcbf5";
 
 function checkResult(operation, result) {
     if (result < 0) throw new Error(`${operation} failed with zenoh-pico error ${result}`);
@@ -77,7 +77,7 @@ async function createBinding(options) {
         // `new URL("zenoh-pico.wasm", import.meta.url)` reference to a hashed
         // production asset. A dynamic fallback here defeats that rewrite and
         // makes SPA hosts return index.html for the missing unhashed URL.
-        locateFile: options.locateFile,
+        locateFile: options.locateFile ?? (path => path === "zenoh-pico.wasm" ? new URL("./zenoh-pico.wasm?v=d0e9be69d8cee5c6702357ab2f793f0f60a39d7e4404fe5ad58281f0803f866d", import.meta.url).href : path),
         zenohPicoReceiveBufferBytes: options.receiveBufferBytes,
         print: options.print,
         printErr: options.printErr,

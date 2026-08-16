@@ -106,6 +106,14 @@ static z_result_t _z_get_keyexpr_from_wireexpr_inner(_z_keyexpr_t *ret, _z_resou
     } else {
         _z_resource_t *res = _z_get_resource_by_id_inner(xs, id);
         if (res == NULL) {
+            size_t resource_count = 0;
+            _z_resource_slist_t *resource = xs;
+            while (resource != NULL) {
+                resource_count++;
+                resource = _z_resource_slist_next(resource);
+            }
+            _Z_ERROR("Unknown wire keyexpr scope: %u, mapping: %zu, known resources: %zu",
+                     (unsigned int)id, (size_t)expr->_mapping, resource_count);
             return _Z_ERR_KEYEXPR_UNKNOWN;
         }
         _z_keyexpr_t ke_prefix = _z_keyexpr_alias(&res->_key);
@@ -207,7 +215,15 @@ z_result_t _z_unregister_resource(_z_session_t *zn, uint16_t id, _z_transport_pe
         _z_resource_slist_value(res_ptr)->_refcount--;
         if (_z_resource_slist_value(res_ptr)->_refcount == 0) {
             ret = _Z_RES_OK;
-            *resources = _z_resource_slist_drop_first_filter(*resources, _z_resource_eq, &res);
+            // Keep locally-owned mappings as zero-refcount tombstones until the
+            // session closes. A peer may already have queued a declaration whose
+            // Receiver mapping refers to this ID; discarding it here turns that
+            // otherwise harmless late declaration into _Z_ERR_KEYEXPR_UNKNOWN and
+            // tears down the whole transport. A later declaration of the same key
+            // reuses the tombstone and re-announces the mapping on the wire.
+            if (!is_local) {
+                *resources = _z_resource_slist_drop_first_filter(*resources, _z_resource_eq, &res);
+            }
         }
     }
     _z_session_mutex_unlock(zn);
