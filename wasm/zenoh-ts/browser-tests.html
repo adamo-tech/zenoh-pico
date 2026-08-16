@@ -23,7 +23,7 @@ button { padding: .7rem 1rem; font: inherit; }
 import {createZenohPico, SampleKind, Priority, CongestionControl, Reliability, PicoTimestamp,
     QueryTarget, ConsolidationMode, ReplyKeyExpr, PicoReplyError} from "./index.mjs";
 
-const endpoint = "webtransport/127.0.0.1:7448#tout=3000";
+const endpoint = "webtransport/127.0.0.1:7448/zenoh#tout=3000";
 const certificateHash = "nYssBVdaYdbVnmBjLeFKA2ZCroIMlXzn3CTN6kmRUP0=";
 const query = new URLSearchParams(location.search);
 const configuredReceiveBufferBytes = Number(query.get("receiveBufferBytes") || 65536);
@@ -132,10 +132,15 @@ async function runAll() {
     run.disabled = true; results.replaceChildren(); benchmarks.replaceChildren(); rows.clear();
     summary.textContent = "Running…";
     let passed = 0, total = 0;
-    const check = async (name, fn) => { total++; if (await test(name, fn)) passed++; };
+    const check = async (name, fn) => {
+        total++;
+        const ok = await test(name, fn);
+        if (ok) passed++;
+        return ok;
+    };
     let pico, sessionA, sessionB;
 
-    await check("ES module, WASM and ABI v7", async () => {
+    const runtimeReady = await check("ES module, WASM and ABI v7", async () => {
         pico = await createZenohPico({
             certificateHash,
             receiveBufferBytes: configuredReceiveBufferBytes,
@@ -154,15 +159,30 @@ async function runAll() {
         });
         return `Modular package initialized and ABI check accepted; receive buffer ${configuredReceiveBufferBytes} B`;
     });
+    if (!runtimeReady) {
+        summary.textContent = `${passed}/${total} prerequisite tests passed; stopped before opening sessions`;
+        run.disabled = false;
+        return;
+    }
     await check("Certificate hash rejection", async () => {
         const bad = await createZenohPico({certificateHash: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
         try { await bad.open(endpoint); } catch (_) { return "Incorrect SHA-256 hash rejected"; }
         throw new Error("connection unexpectedly accepted an incorrect certificate hash");
     });
-    await check("Two concurrent sessions", async () => {
+    const sessionsReady = await check("Two concurrent sessions", async () => {
         sessionA = await pico.open(endpoint); sessionB = await pico.open(endpoint);
         return "Both sessions opened in isolated WASM instances in the same JavaScript realm";
     });
+    if (!sessionsReady) {
+        await sessionA?.close().catch(() => {});
+        await sessionB?.close().catch(() => {});
+        summary.textContent = `${passed}/${total} prerequisite tests passed; stopped because sessions did not open`;
+        run.disabled = false;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({
+            status: "FINAL", passed, total, stopped: "session-open",
+        })}).catch(() => {});
+        return;
+    }
     await check("Session identity", async () => {
         const a = (await sessionA.info()).zid.toString();
         const b = (await sessionB.info()).zid.toString();

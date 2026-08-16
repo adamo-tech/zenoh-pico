@@ -117,8 +117,11 @@ EM_ASYNC_JS(int, _zp_webtransport_js_read, (int handle, uint8_t *dst, size_t len
 
 EM_JS(int, _zp_webtransport_js_read_nonblocking, (int handle, uint8_t *dst, size_t len), {
     const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
-    if (!link) return -1;
-    if (link.incomingBytes === 0) return link.closed ? -1 : 0;
+    // Match the streamed-socket contract used by Pico's unicast read task:
+    // zero means EOF/closed, while -1 maps to SIZE_MAX and means that a
+    // non-blocking read has no data available yet.
+    if (!link) return 0;
+    if (link.incomingBytes === 0) return link.closed ? 0 : -1;
     const wanted = Math.min(len, link.incomingBytes);
     let copied = 0;
     while (copied < wanted) {
