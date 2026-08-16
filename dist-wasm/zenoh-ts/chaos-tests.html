@@ -1,0 +1,564 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zenoh-Pico WebTransport chaos tests</title>
+<style>
+body { font: 15px system-ui; margin: 2rem auto; max-width: 76rem; padding: 0 1rem; color: #18202a; }
+h1 { margin-bottom: .25rem; }
+#summary { font-size: 1.1rem; margin: 1rem 0; padding: 1rem; border-radius: .5rem; background: #eef2f6; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: .65rem; border-bottom: 1px solid #d9dee5; text-align: left; vertical-align: top; }
+.running { color: #7a5b00; } .pass { color: #087830; } .fail { color: #b00020; font-weight: 650; }
+pre { white-space: pre-wrap; font-size: 12px; margin: .3rem 0 0; max-height: 24rem; overflow: auto; }
+button { padding: .7rem 1rem; font: inherit; }
+</style>
+<h1>Zenoh-Pico WebTransport chaos tests</h1>
+<p>Recovery-focused faults: message loss during an outage is allowed; corruption, wedging and failed recovery are not.</p>
+<button id="run">Run chaos suite</button>
+<div id="summary">Ready.</div>
+<table><thead><tr><th>Scenario</th><th>Result</th><th>Details</th></tr></thead><tbody id="results"></tbody></table>
+<script type="module">
+const {createZenohPico} = await import(`./browser-index.mjs?v=${Date.now()}`);
+
+// Port 7449 is a transparent QUIC/UDP fault proxy; zenohd listens on 7448.
+const endpoint = "webtransport/127.0.0.1:7449/zenoh#tout=3000";
+const certificateHash = "nYssBVdaYdbVnmBjLeFKA2ZCroIMlXzn3CTN6kmRUP0=";
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const busyWait = ms => {
+    const deadline = performance.now() + ms;
+    while (performance.now() < deadline) {}
+};
+const query = new URLSearchParams(location.search);
+const only = query.get("only")?.toLowerCase();
+let seed = query.has("seed") ? Number(query.get("seed")) : NaN;
+if (!Number.isSafeInteger(seed)) seed = crypto.getRandomValues(new Uint32Array(1))[0];
+seed >>>= 0;
+let randomState = seed || 0x6d2b79f5;
+const random = () => {
+    randomState |= 0; randomState = randomState + 0x6d2b79f5 | 0;
+    let value = Math.imul(randomState ^ randomState >>> 15, 1 | randomState);
+    value = value + Math.imul(value ^ value >>> 7, 61 | value) ^ value;
+    return ((value ^ value >>> 14) >>> 0) / 4294967296;
+};
+
+const diagnostics = [];
+let activePair;
+function recordDiagnostic(event) {
+    diagnostics.push({atMs: performance.now(), ...event});
+    if (diagnostics.length > 400) diagnostics.splice(0, diagnostics.length - 400);
+}
+function recoveryTimeline(startIndex, faultAt, functionalAt) {
+    const events = diagnostics.slice(startIndex);
+    const failure = events.find(event => event.atMs >= faultAt &&
+        ["read-pump-done", "read-pump-failed", "transport-closed", "transport-failed", "write-failed"]
+            .includes(event.event));
+    const ready = events.find(event => event.atMs >= faultAt && event.event === "open-ready");
+    const elapsed = at => at === undefined ? "not observed" : `${Math.max(0, at - faultAt).toFixed(0)} ms`;
+    return `fault→failure ${elapsed(failure?.atMs)}, fault→WebTransport ready ${elapsed(ready?.atMs)}, ` +
+        `fault→functional sample ${elapsed(functionalAt)}`;
+}
+function errorText(error) { return error?.stack || error?.message || String(error); }
+async function control(action) {
+    const response = await fetch(`/control/router/${action}`, {method: "POST"});
+    if (!response.ok) throw new Error(`${action}: ${await response.text()}`);
+}
+async function controlJson(path, body = {}) {
+    const response = await fetch(`/control/${path}`, {
+        method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`${path}: ${await response.text()}`);
+    return response.status === 204 ? undefined : response.json();
+}
+const resetNetwork = () => controlJson("network/reset");
+const setNetwork = policy => controlJson("network/set", policy);
+const networkStats = () => controlJson("network/stats");
+const scheduleFlap = options => controlJson("router/flap", options);
+async function ensureRouter() { await control("start"); await sleep(150); }
+
+function makePayload(size, sequence) {
+    const payload = new Uint8Array(size);
+    const view = new DataView(payload.buffer);
+    if (size >= 4) view.setUint32(0, sequence, true);
+    for (let index = 4; index < size; index++) payload[index] = (sequence * 131 + index * 17) & 255;
+    return payload;
+}
+function verifyPayload(payload, size, sequence) {
+    if (payload.length !== size) throw new Error(`payload length ${payload.length}, expected ${size}`);
+    if (size >= 4 && new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(0, true) !== sequence) {
+        throw new Error(`payload sequence header corrupted (expected ${sequence})`);
+    }
+    for (let index = 4; index < size; index++) {
+        const expected = (sequence * 131 + index * 17) & 255;
+        if (payload[index] !== expected) throw new Error(`payload ${sequence} corrupted at byte ${index}`);
+    }
+}
+function inbox(callback) {
+    const queued = [], waiters = [];
+    return {
+        callback(sample) {
+            callback?.(sample);
+            const waiter = waiters.shift(); waiter ? waiter.resolve(sample) : queued.push(sample);
+        },
+        next(timeoutMs = 2000) {
+            if (queued.length) return Promise.resolve(queued.shift());
+            return new Promise((resolve, reject) => {
+                const waiter = {resolve: value => { clearTimeout(timer); resolve(value); }};
+                const timer = setTimeout(() => {
+                    const index = waiters.indexOf(waiter); if (index >= 0) waiters.splice(index, 1);
+                    reject(new Error(`sample timeout after ${timeoutMs} ms`));
+                }, timeoutMs);
+                waiters.push(waiter);
+            });
+        },
+    };
+}
+async function pair() {
+    const pico = await createZenohPico({certificateHash, receiveBufferBytes: 65536, onDiagnostic: recordDiagnostic});
+    const sender = await pico.open(endpoint);
+    const receiver = await pico.open(endpoint);
+    activePair = {sender, receiver};
+    return activePair;
+}
+async function closePair(value) {
+    await Promise.allSettled([value?.sender?.close(), value?.receiver?.close()]);
+    if (activePair === value) activePair = undefined;
+}
+function armRecoveryWatchdog(value, delayMs = 1500) {
+    return setTimeout(() => {
+        value?.sender?.forceReconnect("functional watchdog expired");
+        value?.receiver?.forceReconnect("functional watchdog expired");
+    }, delayMs);
+}
+async function recoveryProbe(sender, box, key, sequence, size = 32768, timeoutMs = 5000) {
+    const deadline = performance.now() + timeoutMs;
+    let attempts = 0;
+    while (performance.now() < deadline) {
+        const payload = makePayload(size, sequence + attempts);
+        try {
+            await sender.put(key, payload);
+            const sample = await box.next(1200);
+            const observed = new DataView(sample.payload.buffer, sample.payload.byteOffset, sample.payload.byteLength)
+                .getUint32(0, true);
+            verifyPayload(sample.payload, size, observed);
+            if (observed >= sequence) return attempts + 1;
+        } catch (_) {}
+        attempts++; await sleep(100);
+    }
+    throw new Error(`sessions did not recover within ${timeoutMs} ms`);
+}
+function diagnosticSnapshot(value = activePair) {
+    return JSON.stringify({
+        sender: value?.sender?.diagnostics(), receiver: value?.receiver?.diagnostics(),
+        diagnostics: diagnostics.slice(-80),
+    }, null, 2);
+}
+async function scenario(name, action) {
+    const row = document.createElement("tr");
+    row.innerHTML = `<td>${name}</td><td class="running">RUNNING</td><td><pre></pre></td>`;
+    results.append(row); const started = performance.now();
+    try {
+        await ensureRouter(); await resetNetwork();
+        const detail = await action();
+        row.children[1].textContent = "PASS"; row.children[1].className = "pass";
+        row.querySelector("pre").textContent = `${detail} (${(performance.now() - started).toFixed(0)} ms)`;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({name, status: "CHAOS_PASS", detail, seed})}).catch(() => {});
+        return true;
+    } catch (error) {
+        row.children[1].textContent = "FAIL"; row.children[1].className = "fail";
+        row.querySelector("pre").textContent = `${errorText(error)}\n${diagnosticSnapshot()}`;
+        fetch("/control/report", {method: "POST", body: JSON.stringify({name, status: "CHAOS_FAIL", detail: errorText(error), seed})}).catch(() => {});
+        return false;
+    } finally {
+        await resetNetwork().catch(() => {}); await ensureRouter().catch(() => {});
+    }
+}
+
+async function runChaos() {
+    run.disabled = true; results.replaceChildren(); diagnostics.length = 0;
+    summary.textContent = `Running with seed ${seed}…`;
+    let passed = 0, total = 0;
+    const check = async (name, action) => {
+        if (only && !name.toLowerCase().includes(only)) return;
+        total++; if (await scenario(name, action)) passed++;
+    };
+
+    await check("Fragment boundaries and coalesced frames", async () => {
+        const value = await pair(), key = "chaos/boundaries", box = inbox();
+        const sub = await value.receiver.declareSubscriber(key, box.callback);
+        const sizes = [65531, 65532, 65533, 65534, 65535, 65536, 65537, 65538, 65539,
+            131069, 131070, 131071, 131072, 131073, 1048574, 1048576, 1048578];
+        try {
+            for (let round = 0; round < 2; round++) {
+                for (const size of [...sizes].sort(() => random() - .5)) {
+                    const sequence = round * 100 + sizes.indexOf(size);
+                    await value.sender.put(key, makePayload(size, sequence));
+                    verifyPayload((await box.next(15000)).payload, size, sequence);
+                }
+            }
+            return `${sizes.length * 2} byte-for-byte samples spanning 64 KiB, 128 KiB and 1 MiB boundaries`;
+        } finally { await sub.undeclare().catch(() => {}); await closePair(value); }
+    });
+
+    await check("Hard kill during fragmented transmissions", async () => {
+        const value = await pair(), key = "chaos/fragment-kill"; let corrupt = 0, delivered = 0;
+        const box = inbox(sample => { delivered++; try {
+            const seq = new DataView(sample.payload.buffer, sample.payload.byteOffset, sample.payload.byteLength).getUint32(0, true);
+            verifyPayload(sample.payload, sample.payload.length, seq);
+        } catch (_) { corrupt++; }});
+        const sub = await value.receiver.declareSubscriber(key, box.callback); await sleep(100);
+        try {
+            const sends = Array.from({length: 12}, (_, index) => value.sender.put(key, makePayload(1048576, index)));
+            await sleep(5 + Math.floor(random() * 20));
+            const diagnosticStart = diagnostics.length, faultAt = performance.now();
+            const watchdog = armRecoveryWatchdog(value); await control("kill");
+            await sleep(100 + Math.floor(random() * 400)); await control("start");
+            await Promise.allSettled(sends);
+            const attempts = await recoveryProbe(value.sender, box, key, 1000, 262144);
+            const functionalAt = performance.now();
+            clearTimeout(watchdog);
+            if (functionalAt - faultAt > 5000) {
+                throw new Error(`functional recovery exceeded 5 seconds: ${(functionalAt - faultAt).toFixed(0)} ms`);
+            }
+            if (corrupt) throw new Error(`${corrupt} corrupted sample(s) observed`);
+            return `${delivered} complete pre/post-fault samples; recovered in ${attempts} probe attempt(s); ` +
+                recoveryTimeline(diagnosticStart, faultAt, functionalAt);
+        } finally { await sub.undeclare().catch(() => {}); await closePair(value); }
+    });
+
+    await check("Repeated random router flaps under 30 Mbps traffic", async () => {
+        const value = await pair(), key = "chaos/video", probeKey = "chaos/video/probe";
+        let running = true, sent = 0, sendErrors = 0, received = 0, corrupt = 0;
+        const box = inbox(sample => { received++; try {
+            const seq = new DataView(sample.payload.buffer, sample.payload.byteOffset, sample.payload.byteLength).getUint32(0, true);
+            verifyPayload(sample.payload, 32768, seq);
+        } catch (_) { corrupt++; }});
+        const sub = await value.receiver.declareSubscriber(key, box.callback);
+        const probeBox = inbox(); const probeSub = await value.receiver.declareSubscriber(probeKey, probeBox.callback);
+        await sleep(100);
+        const transmit = (async () => { while (running) {
+            try { await value.sender.put(key, makePayload(32768, sent++)); } catch (_) { sendErrors++; }
+            await sleep(8);
+        }})();
+        try {
+            for (let cycle = 0; cycle < 4; cycle++) {
+                await sleep(150 + Math.floor(random() * 350));
+                const watchdog = armRecoveryWatchdog(value); await control("kill");
+                await sleep(50 + Math.floor(random() * 1200)); await control("start");
+                await recoveryProbe(value.sender, probeBox, probeKey, 10000 + cycle * 100, 256);
+                clearTimeout(watchdog);
+            }
+            running = false; await transmit;
+            await recoveryProbe(value.sender, probeBox, probeKey, 20000, 256);
+            if (corrupt) throw new Error(`${corrupt} corrupted video packet(s)`);
+            return `${sent} submissions, ${received} complete deliveries, ${sendErrors} rejected during four hard outages`;
+        } finally {
+            running = false; await transmit.catch(() => {});
+            await Promise.allSettled([sub.undeclare(), probeSub.undeclare()]); await closePair(value);
+        }
+    });
+
+    await check("Backpressure burst interrupted by outage", async () => {
+        const value = await pair(), key = "chaos/backpressure", probeKey = "chaos/backpressure/probe"; let corrupt = 0;
+        const box = inbox(sample => { try {
+            const seq = new DataView(sample.payload.buffer, sample.payload.byteOffset, sample.payload.byteLength).getUint32(0, true);
+            verifyPayload(sample.payload, sample.payload.length, seq);
+        } catch (_) { corrupt++; }});
+        const sub = await value.receiver.declareSubscriber(key, box.callback);
+        const probeBox = inbox(); const probeSub = await value.receiver.declareSubscriber(probeKey, probeBox.callback);
+        await sleep(100);
+        try {
+            const burst = Array.from({length: 96}, (_, index) => value.sender.put(key, makePayload(262144, index)));
+            await sleep(10); const watchdog = armRecoveryWatchdog(value); await control("kill");
+            await sleep(300); await control("start");
+            const settled = await Promise.allSettled(burst);
+            const attempts = await recoveryProbe(value.sender, probeBox, probeKey, 1000, 256);
+            clearTimeout(watchdog);
+            if (corrupt) throw new Error(`${corrupt} corrupted burst sample(s)`);
+            return `${settled.filter(item => item.status === "fulfilled").length}/${burst.length} submissions accepted; recovery probe in ${attempts} attempt(s)`;
+        } finally { await Promise.allSettled([sub.undeclare(), probeSub.undeclare()]); await closePair(value); }
+    });
+
+    await check("Control queries and video recover together", async () => {
+        const value = await pair(), videoKey = "chaos/mixed/video", queryKey = "chaos/mixed/control";
+        const box = inbox(); const sub = await value.receiver.declareSubscriber(videoKey, box.callback);
+        const queryable = await value.sender.declareQueryable(queryKey, async queryValue => {
+            await queryValue.reply(encoder.encode(`reply:${decoder.decode(queryValue.payload)}`), {keyExpr: queryKey});
+        });
+        try {
+            const queryOnce = async () => {
+                const receiver = await value.receiver.get(queryKey, {payload: encoder.encode("idr"), timeoutMs: 1500});
+                for await (const reply of receiver) {
+                    if (reply.isOk()) return decoder.decode(reply.result().payload);
+                }
+            };
+            const baseline = await queryOnce();
+            if (baseline !== "reply:idr") throw new Error(`pre-fault control query failed: ${baseline}`);
+            const faultAt = performance.now(), watchdog = armRecoveryWatchdog(value);
+            await control("kill"); await sleep(500); await control("start");
+            const attempts = await recoveryProbe(value.sender, box, videoKey, 5000, 65536);
+            let queryReply;
+            const deadline = performance.now() + 5000;
+            while (!queryReply && performance.now() < deadline) {
+                try {
+                    queryReply = await queryOnce();
+                } catch (_) { await sleep(150); }
+            }
+            clearTimeout(watchdog);
+            if (queryReply !== "reply:idr") throw new Error(`control query did not recover: ${queryReply}`);
+            if (performance.now() - faultAt > 5000) {
+                throw new Error(`video and control recovery exceeded 5 seconds: ${(performance.now() - faultAt).toFixed(0)} ms`);
+            }
+            return `existing video subscriber recovered in ${attempts} probe(s); existing queryable returned ${queryReply}`;
+        } finally { await queryable.undeclare().catch(() => {}); await sub.undeclare().catch(() => {}); await closePair(value); }
+    });
+
+    await check("Impaired QUIC, CPU/GC pressure and relay flap", async () => {
+        const value = await pair(), videoKey = "chaos/combined/video", queryKey = "chaos/combined/control";
+        let running = true, sequence = 0, accepted = 0, rejected = 0, received = 0, corrupt = 0;
+        const box = inbox(sample => {
+            // Model synchronous decode/render work on the browser main thread.
+            busyWait(2 + random() * 6);
+            received++;
+            try {
+                const observed = new DataView(sample.payload.buffer, sample.payload.byteOffset, sample.payload.byteLength)
+                    .getUint32(0, true);
+                verifyPayload(sample.payload, sample.payload.length, observed);
+            } catch (_) { corrupt++; }
+        });
+        const sub = await value.receiver.declareSubscriber(videoKey, box.callback);
+        const queryable = await value.sender.declareQueryable(queryKey, async incoming => {
+            await incoming.reply(encoder.encode(`idr:${decoder.decode(incoming.payload)}`));
+        });
+        const queryOnce = async () => {
+            const replies = await value.receiver.get(queryKey, {payload: encoder.encode("now"), timeoutMs: 1200});
+            for await (const reply of replies) if (reply.isOk()) return decoder.decode(reply.result().payload);
+        };
+        const transmit = (async () => {
+            while (running) {
+                const current = sequence++;
+                const size = current % 60 === 0 ? 1048576 : [8192, 32768, 65536][current % 3];
+                try { await value.sender.put(videoKey, makePayload(size, current)); accepted++; }
+                catch (_) { rejected++; }
+                await sleep(8 + Math.floor(random() * 9));
+            }
+        })();
+        try {
+            if (await queryOnce() !== "idr:now") throw new Error("control plane was not ready before fault injection");
+            await setNetwork({
+                seed, resetStats: true, loss: 0.03, duplicate: 0.01, reorder: 0.08,
+                latencyMs: 12, jitterMs: 45, reorderMs: 100,
+                bandwidthBytesPerSecond: 8 * 1024 * 1024,
+            });
+            const watchdog = setTimeout(() => {
+                value.sender.forceReconnect("combined-fault watchdog expired");
+                value.receiver.forceReconnect("combined-fault watchdog expired");
+            }, 2800);
+            await scheduleFlap({delayMs: 1300, downMs: 900, hard: true});
+            const pressureDeadline = performance.now() + 9000;
+            while (performance.now() < pressureDeadline) {
+                // Force memory growth/collection and scheduler gaps while QUIC is lossy.
+                const garbage = Array.from({length: 8}, () => new Uint8Array(2 * 1024 * 1024));
+                for (let index = 0; index < garbage.length; index++) garbage[index][index * 4096] = index;
+                busyWait(40 + random() * 260);
+                await sleep(20 + random() * 80);
+            }
+            running = false; await transmit;
+            clearTimeout(watchdog);
+            const impairment = await networkStats();
+            await resetNetwork();
+            const probes = await recoveryProbe(value.sender, box, videoKey, 50000, 65536);
+            let controlReply;
+            const deadline = performance.now() + 5000;
+            while (controlReply !== "idr:now" && performance.now() < deadline) {
+                try { controlReply = await queryOnce(); } catch (_) {}
+                if (controlReply !== "idr:now") await sleep(100);
+            }
+            if (controlReply !== "idr:now") throw new Error(`control plane did not recover: ${controlReply}`);
+            if (corrupt) throw new Error(`${corrupt} corrupted video sample(s)`);
+            return `${accepted} accepted, ${rejected} rejected, ${received} complete; recovered in ${probes} probes; ` +
+                `${impairment.stats.dropped} QUIC packets dropped, ${impairment.stats.reordered} delayed for reordering`;
+        } finally {
+            running = false; await transmit.catch(() => {}); await resetNetwork().catch(() => {});
+            await Promise.allSettled([queryable.undeclare(), sub.undeclare()]); await closePair(value);
+        }
+    });
+
+    await check("Twelve-second browser suspension over unhealthy relay", async () => {
+        const value = await pair(), key = "chaos/suspend/video"; let corrupt = 0;
+        const box = inbox(sample => {
+            try {
+                const observed = new DataView(sample.payload.buffer, sample.payload.byteOffset, sample.payload.byteLength)
+                    .getUint32(0, true);
+                verifyPayload(sample.payload, sample.payload.length, observed);
+            } catch (_) { corrupt++; }
+        });
+        const sub = await value.receiver.declareSubscriber(key, box.callback);
+        try {
+            await recoveryProbe(value.sender, box, key, 60000, 32768, 5000);
+            await setNetwork({seed: seed ^ 0xa5a5a5a5, resetStats: true, loss: 0.05, reorder: 0.12,
+                latencyMs: 25, jitterMs: 80, reorderMs: 160});
+            await scheduleFlap({delayMs: 750, downMs: 2500, hard: true});
+            const watchdog = armRecoveryWatchdog(value);
+            // Longer than Pico's 10-second lease: timers, WASM polling and callbacks all stop.
+            busyWait(12000);
+            await resetNetwork();
+            const probes = await recoveryProbe(value.sender, box, key, 61000, 262144);
+            clearTimeout(watchdog);
+            if (corrupt) throw new Error(`${corrupt} corrupted sample(s) after suspension`);
+            return `existing session and subscriber recovered in ${probes} probes after scheduler freeze and relay restart`;
+        } finally { await resetNetwork().catch(() => {}); await sub.undeclare().catch(() => {}); await closePair(value); }
+    });
+
+    await check("Silent QUIC blackhole with browser pressure", async () => {
+        const value = await pair(), videoKey = "chaos/blackhole/video", queryKey = "chaos/blackhole/control";
+        let corrupt = 0;
+        const box = inbox(sample => {
+            try {
+                const observed = new DataView(sample.payload.buffer, sample.payload.byteOffset, sample.payload.byteLength)
+                    .getUint32(0, true);
+                verifyPayload(sample.payload, sample.payload.length, observed);
+            } catch (_) { corrupt++; }
+        });
+        const sub = await value.receiver.declareSubscriber(videoKey, box.callback);
+        const queryable = await value.sender.declareQueryable(queryKey, incoming => incoming.reply(encoder.encode("idr")));
+        const queryOnce = async () => {
+            const replies = await value.receiver.get(queryKey, {timeoutMs: 1000});
+            for await (const reply of replies) if (reply.isOk()) return decoder.decode(reply.result().payload);
+        };
+        try {
+            await recoveryProbe(value.sender, box, videoKey, 70000, 32768);
+            if (await queryOnce() !== "idr") throw new Error("control plane was not ready before blackhole");
+            await setNetwork({seed: seed ^ 0x51f15e, resetStats: true, loss: 1});
+            const watchdog = armRecoveryWatchdog(value);
+            const pressureEnd = performance.now() + 2500;
+            while (performance.now() < pressureEnd) {
+                const garbage = new Uint8Array(4 * 1024 * 1024);
+                garbage[Math.floor(random() * garbage.length)] = 1;
+                busyWait(40 + random() * 120); await sleep(20);
+            }
+            const impairment = await networkStats();
+            const recoveryAt = performance.now(); await resetNetwork();
+            const probes = await recoveryProbe(value.sender, box, videoKey, 71000, 65536);
+            let reply;
+            const deadline = performance.now() + 5000;
+            while (reply !== "idr" && performance.now() < deadline) {
+                try { reply = await queryOnce(); } catch (_) {}
+                if (reply !== "idr") await sleep(100);
+            }
+            clearTimeout(watchdog);
+            if (reply !== "idr") throw new Error(`control query did not recover: ${reply}`);
+            if (performance.now() - recoveryAt > 5000) throw new Error("blackhole recovery exceeded 5 seconds");
+            if (corrupt) throw new Error(`${corrupt} corrupted sample(s)`);
+            return `${impairment.stats.dropped} QUIC packets silently dropped; video+control recovered in ` +
+                `${(performance.now() - recoveryAt).toFixed(0)} ms and ${probes} probe(s)`;
+        } finally {
+            await resetNetwork().catch(() => {});
+            await Promise.allSettled([queryable.undeclare(), sub.undeclare()]); await closePair(value);
+        }
+    });
+
+    await check("CPU-frozen relay under lossy browser load", async () => {
+        const value = await pair(), key = "chaos/frozen-relay/video";
+        let corrupt = 0, accepted = 0, rejected = 0;
+        const box = inbox(sample => {
+            busyWait(2 + random() * 5);
+            try {
+                const observed = new DataView(sample.payload.buffer, sample.payload.byteOffset, sample.payload.byteLength)
+                    .getUint32(0, true);
+                verifyPayload(sample.payload, sample.payload.length, observed);
+            } catch (_) { corrupt++; }
+        });
+        const sub = await value.receiver.declareSubscriber(key, box.callback);
+        try {
+            await recoveryProbe(value.sender, box, key, 72000, 32768);
+            await setNetwork({seed: seed ^ 0xf20e, resetStats: true, loss: 0.02, reorder: 0.06,
+                latencyMs: 15, jitterMs: 50, reorderMs: 100});
+            await controlJson("router/freeze", {delayMs: 500, durationMs: 2500});
+            const watchdog = setTimeout(() => {
+                value.sender.forceReconnect("frozen-relay watchdog expired");
+                value.receiver.forceReconnect("frozen-relay watchdog expired");
+            }, 1800);
+            const loadEnd = performance.now() + 5000; let sequence = 0;
+            while (performance.now() < loadEnd) {
+                const size = sequence % 25 === 0 ? 1048576 : 32768;
+                try { await value.sender.put(key, makePayload(size, 73000 + sequence)); accepted++; }
+                catch (_) { rejected++; }
+                sequence++;
+                if (sequence % 8 === 0) busyWait(20 + random() * 100);
+                await sleep(8);
+            }
+            clearTimeout(watchdog); await resetNetwork();
+            const recoveryAt = performance.now();
+            const probes = await recoveryProbe(value.sender, box, key, 74000, 262144);
+            if (performance.now() - recoveryAt > 5000) throw new Error("frozen-relay recovery exceeded 5 seconds");
+            if (corrupt) throw new Error(`${corrupt} corrupted sample(s)`);
+            return `${accepted} accepted/${rejected} rejected while relay was SIGSTOPed; recovered in ${probes} probe(s)`;
+        } finally {
+            await control("resume").catch(() => {}); await resetNetwork().catch(() => {});
+            await sub.undeclare().catch(() => {}); await closePair(value);
+        }
+    });
+
+    await check("WASM heap plateaus across large-message reconnect cycles", async () => {
+        const value = await pair(), key = "chaos/memory/video", box = inbox();
+        const sub = await value.receiver.declareSubscriber(key, box.callback); const snapshots = [];
+        try {
+            for (let round = 0; round < 3; round++) {
+                for (let index = 0; index < 12; index++) {
+                    const sequence = 80000 + round * 100 + index;
+                    await value.sender.put(key, makePayload(1048576, sequence));
+                    verifyPayload((await box.next(5000)).payload, 1048576, sequence);
+                }
+                value.sender.forceReconnect(`memory cycle ${round}`);
+                value.receiver.forceReconnect(`memory cycle ${round}`);
+                await recoveryProbe(value.sender, box, key, 81000 + round, 262144);
+                snapshots.push({sender: value.sender.memoryDiagnostics(), receiver: value.receiver.memoryDiagnostics()});
+            }
+            const first = Math.max(snapshots[0].sender.wasmHeapBytes, snapshots[0].receiver.wasmHeapBytes);
+            const last = Math.max(snapshots.at(-1).sender.wasmHeapBytes, snapshots.at(-1).receiver.wasmHeapBytes);
+            if (last > first + 16 * 1024 * 1024) {
+                throw new Error(`WASM heap kept growing: ${first} → ${last} bytes`);
+            }
+            for (const [index, snapshot] of snapshots.entries()) {
+                if (snapshot.sender.ownedTransportLinks !== 1 || snapshot.receiver.ownedTransportLinks !== 1) {
+                    throw new Error(`transport link leak after cycle ${index}: ${JSON.stringify(snapshot)}`);
+                }
+            }
+            return `three 12 MiB + reconnect cycles; heap ${first} → ${last} B; exactly one live link/session`;
+        } finally { await sub.undeclare().catch(() => {}); await closePair(value); }
+    });
+
+    await check("Reconnect storm", async () => {
+        const value = await pair(), key = "chaos/storm", box = inbox();
+        const sub = await value.receiver.declareSubscriber(key, box.callback); await sleep(100);
+        try {
+            const watchdog = armRecoveryWatchdog(value);
+            for (let cycle = 0; cycle < 6; cycle++) {
+                await control("kill"); await sleep(40 + Math.floor(random() * 160));
+                await control("start"); await sleep(40 + Math.floor(random() * 160));
+            }
+            await control("start");
+            const attempts = await recoveryProbe(value.sender, box, key, 9000, 65536);
+            clearTimeout(watchdog);
+            return `survived six kill/start cycles; recovered in ${attempts} probe attempt(s)`;
+        } finally { await sub.undeclare().catch(() => {}); await closePair(value); }
+    });
+
+    await check("Idempotent shutdown while reconnecting", async () => {
+        const value = await pair(); await control("kill"); await sleep(100);
+        const started = performance.now();
+        await Promise.all([value.sender.close(), value.sender.close(), value.receiver.close(), value.receiver.close()]);
+        const elapsed = performance.now() - started; await control("start");
+        if (elapsed > 5000) throw new Error(`shutdown took ${elapsed.toFixed(0)} ms`);
+        return `both sessions closed twice during outage in ${elapsed.toFixed(0)} ms`;
+    });
+
+    summary.textContent = `${passed}/${total} chaos scenarios passed · seed ${seed}`;
+    fetch("/control/report", {method: "POST", body: JSON.stringify({status: "CHAOS_FINAL", passed, total, seed})}).catch(() => {});
+    run.disabled = false;
+}
+
+run.onclick = () => { void runChaos(); };
+</script>

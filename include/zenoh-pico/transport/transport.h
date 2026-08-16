@@ -28,6 +28,7 @@
 #include "zenoh-pico/protocol/definitions/transport.h"
 #include "zenoh-pico/runtime/runtime.h"
 #include "zenoh-pico/session/weak_session.h"
+#include "zenoh-pico/transport/utils.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,6 +93,7 @@ typedef struct {
     _z_transport_peer_common_t common;
     _z_slice_t _remote_addr;
     _z_conduit_sn_list_t _sn_rx_sns;
+    _z_sn_window_t _sn_rx_best_effort_window;
     // SN numbers
     _z_zint_t _sn_res;
     volatile _z_zint_t _lease;
@@ -125,6 +127,7 @@ typedef struct {
     // SN numbers
     _z_zint_t _sn_rx_reliable;
     _z_zint_t _sn_rx_best_effort;
+    _z_sn_window_t _sn_rx_best_effort_window;
     bool _pending;
     uint8_t flow_state;
     uint16_t flow_curr_size;

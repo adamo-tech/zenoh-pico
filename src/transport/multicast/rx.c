@@ -206,7 +206,18 @@ static z_result_t _z_multicast_handle_frame(_z_transport_multicast_t *ztm, uint8
         }
     } else {
         tmsg_reliability = Z_RELIABILITY_BEST_EFFORT;
-        if (_z_sn_precedes(entry->_sn_res, entry->_sn_rx_sns._val._plain._best_effort, msg->_sn)) {
+        if (ztm->_common._link->_cap._flow == Z_LINK_CAP_FLOW_DATAGRAM) {
+            const _z_sn_window_result_t result =
+                _z_sn_window_observe(&entry->_sn_rx_best_effort_window, entry->_sn_res, msg->_sn);
+            if (result == _Z_SN_WINDOW_AHEAD) {
+                entry->_sn_rx_sns._val._plain._best_effort = msg->_sn;
+            } else if (result == _Z_SN_WINDOW_REORDERED) {
+                _Z_DEBUG("Accepting reordered best effort frame");
+            } else {
+                _Z_DEBUG("Best effort frame dropped because it is duplicate or outside the reorder window");
+                return _Z_RES_OK;
+            }
+        } else if (_z_sn_precedes(entry->_sn_res, entry->_sn_rx_sns._val._plain._best_effort, msg->_sn)) {
             entry->_sn_rx_sns._val._plain._best_effort = msg->_sn;
         } else {
 #if Z_FEATURE_FRAGMENTATION == 1
@@ -270,6 +281,7 @@ static z_result_t _z_multicast_handle_fragment_inner(_z_transport_multicast_t *z
         if (_z_sn_precedes(entry->_sn_res, entry->_sn_rx_sns._val._plain._best_effort, msg->_sn)) {
             consecutive = _z_sn_consecutive(entry->_sn_res, entry->_sn_rx_sns._val._plain._best_effort, msg->_sn);
             entry->_sn_rx_sns._val._plain._best_effort = msg->_sn;
+            _z_sn_window_reset(&entry->_sn_rx_best_effort_window, msg->_sn);
             dbuf = &entry->common._dbuf_best_effort;
             dbuf_state = &entry->common._state_best_effort;
         } else {
@@ -389,6 +401,7 @@ static z_result_t _z_multicast_handle_join_inner(_z_transport_multicast_t *ztm, 
         entry->_remote_addr = _z_slice_duplicate(addr);
         _z_conduit_sn_list_copy(&entry->_sn_rx_sns, &msg->_next_sn);
         _z_conduit_sn_list_decrement(entry->_sn_res, &entry->_sn_rx_sns);
+        _z_sn_window_reset(&entry->_sn_rx_best_effort_window, entry->_sn_rx_sns._val._plain._best_effort);
         // Update lease time (set as ms during)
         entry->_lease = msg->_lease;
         entry->common._remote_zid = msg->_zid;
@@ -452,6 +465,7 @@ static z_result_t _z_multicast_handle_join_inner(_z_transport_multicast_t *ztm, 
         // Update SNs
         _z_conduit_sn_list_copy(&entry->_sn_rx_sns, &msg->_next_sn);
         _z_conduit_sn_list_decrement(entry->_sn_res, &entry->_sn_rx_sns);
+        _z_sn_window_reset(&entry->_sn_rx_best_effort_window, entry->_sn_rx_sns._val._plain._best_effort);
         // Update lease time (set as ms during)
         entry->_lease = msg->_lease;
     }

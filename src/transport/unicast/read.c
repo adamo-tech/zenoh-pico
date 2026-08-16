@@ -79,25 +79,38 @@ static z_result_t _z_unicast_process_messages(_z_transport_unicast_t *ztu, _z_tr
     return _Z_RES_OK;
 }
 
-static bool _z_unicast_client_read(_z_transport_unicast_t *ztu, _z_transport_peer_unicast_t *peer, size_t *to_read) {
+static z_result_t _z_unicast_client_read(_z_transport_unicast_t *ztu, _z_transport_peer_unicast_t *peer,
+                                         size_t *to_read) {
     switch (ztu->_common._link->_cap._flow) {
         case Z_LINK_CAP_FLOW_STREAM:
             if (_z_zbuf_len(&ztu->_common._zbuf) < _Z_MSG_LEN_ENC_SIZE) {
-                _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                size_t read_size =
+                    _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                if (read_size == 0) return _Z_ERR_TRANSPORT_RX_FAILED;
                 if (_z_zbuf_len(&ztu->_common._zbuf) < _Z_MSG_LEN_ENC_SIZE) {
                     _z_zbuf_compact(&ztu->_common._zbuf);
-                    return false;
+                    return _Z_NO_DATA_PROCESSED;
                 }
             }
             // Get stream size
+            // A previous frame may leave the next frame's prefix at the end of
+            // the buffer. Move that prefix (and any partial body) to the front
+            // before consuming it so the body can use the reclaimed capacity.
+            _z_zbuf_compact(&ztu->_common._zbuf);
             *to_read = _z_read_stream_size(&ztu->_common._zbuf);
             // Read data
             if (_z_zbuf_len(&ztu->_common._zbuf) < *to_read) {
-                _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                if (_z_zbuf_space_left(&ztu->_common._zbuf) == 0) {
+                    _Z_INFO("Stream receive buffer exhausted: frame=%zu readable=%zu capacity=%zu", *to_read,
+                            _z_zbuf_len(&ztu->_common._zbuf), _z_zbuf_capacity(&ztu->_common._zbuf));
+                }
+                size_t read_size =
+                    _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                if (read_size == 0) return _Z_ERR_TRANSPORT_RX_FAILED;
                 if (_z_zbuf_len(&ztu->_common._zbuf) < *to_read) {
                     _z_zbuf_set_rpos(&ztu->_common._zbuf, _z_zbuf_get_rpos(&ztu->_common._zbuf) - _Z_MSG_LEN_ENC_SIZE);
                     _z_zbuf_compact(&ztu->_common._zbuf);
-                    return false;
+                    return _Z_NO_DATA_PROCESSED;
                 }
             }
             break;
@@ -105,13 +118,13 @@ static bool _z_unicast_client_read(_z_transport_unicast_t *ztu, _z_transport_pee
             _z_zbuf_compact(&ztu->_common._zbuf);
             *to_read = _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
             if (*to_read == SIZE_MAX) {
-                return false;
+                return _Z_NO_DATA_PROCESSED;
             }
             break;
         default:
             break;
     }
-    return true;
+    return _Z_RES_OK;
 }
 
 z_result_t _zp_unicast_read(_z_transport_unicast_t *ztu, bool single_read) {
@@ -133,11 +146,14 @@ z_result_t _zp_unicast_read(_z_transport_unicast_t *ztu, bool single_read) {
         _z_zbuf_reset(&ztu->_common._zbuf);
         size_t to_read = 0;
         // Retrieve data if any
-        if (_z_unicast_client_read(ztu, curr_peer, &to_read)) {
+        z_result_t read_result = _z_unicast_client_read(ztu, curr_peer, &to_read);
+        if (read_result == _Z_RES_OK) {
             // Process data
             _Z_RETURN_IF_ERR(_z_unicast_process_messages(ztu, curr_peer, to_read))
-        } else {
+        } else if (read_result == _Z_NO_DATA_PROCESSED) {
             return _Z_NO_DATA_PROCESSED;
+        } else {
+            return read_result;
         }
     }
     return _Z_RES_OK;
@@ -390,13 +406,18 @@ _z_fut_fn_result_t _zp_unicast_read_task_fn(void *ztu_arg, _z_executor_t *execut
         assert(curr_peer != NULL);
         size_t to_read = 0;
         // Retrieve data
-        if (!_z_unicast_client_read(ztu, curr_peer, &to_read)) {
+        z_result_t read_result = _z_unicast_client_read(ztu, curr_peer, &to_read);
+        if (read_result == _Z_NO_DATA_PROCESSED) {
             // nothing to read
 #if Z_RUNTIME_IDLE_READ_TASK_SLEEP > 0
             return _z_fut_fn_result_wake_up_after(Z_RUNTIME_IDLE_READ_TASK_SLEEP);
 #else
             return _z_fut_fn_result_continue();
 #endif
+        }
+        if (read_result != _Z_RES_OK) {
+            _Z_INFO("Read task detected a closed or failed stream, reconnecting\n");
+            return _zp_unicast_failed_result(ztu, executor);
         }
         if (_z_unicast_process_messages(ztu, curr_peer, to_read) != _Z_RES_OK) {
             _Z_INFO("Read task failed, closing session\n");

@@ -32,7 +32,7 @@
 #include "zenoh-pico/transport/multicast/lease.h"
 #include "zenoh-pico/utils/logging.h"
 
-static z_result_t _z_interest_send_decl_resource(_z_session_t *zn, uint32_t interest_id, void *peer,
+static z_result_t _z_interest_send_decl_resource(_z_session_t *zn, _z_optional_id_t interest_id, void *peer,
                                                  const _z_keyexpr_t *restr_key) {
     _Z_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn));
     _z_resource_slist_t *res_list = _z_resource_slist_clone(zn->_local_resources);
@@ -46,7 +46,7 @@ static z_result_t _z_interest_send_decl_resource(_z_session_t *zn, uint32_t inte
             _z_wireexpr_t wireexpr = _z_keyexpr_alias_to_wire(&res->_key);
             _z_declaration_t declaration = _z_make_decl_keyexpr(res->_id, &wireexpr);
             _z_network_message_t n_msg;
-            _z_n_msg_make_declare(&n_msg, declaration, _z_optional_id_make_some(interest_id));
+            _z_n_msg_make_declare(&n_msg, declaration, interest_id);
             z_result_t ret = _z_send_n_msg(zn, &n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, peer);
             _z_n_msg_clear(&n_msg);
             if (ret != _Z_RES_OK) {
@@ -61,7 +61,7 @@ static z_result_t _z_interest_send_decl_resource(_z_session_t *zn, uint32_t inte
 }
 
 #if Z_FEATURE_SUBSCRIPTION == 1
-static z_result_t _z_interest_send_decl_subscriber(_z_session_t *zn, uint32_t interest_id, void *peer,
+static z_result_t _z_interest_send_decl_subscriber(_z_session_t *zn, _z_optional_id_t interest_id, void *peer,
                                                    const _z_keyexpr_t *restr_key) {
     _Z_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn));
     _z_subscription_rc_slist_t *sub_list = _z_subscription_rc_slist_clone(zn->_subscriptions);
@@ -72,10 +72,13 @@ static z_result_t _z_interest_send_decl_subscriber(_z_session_t *zn, uint32_t in
         // Check if key is concerned
         if (restr_key == NULL || _z_keyexpr_intersects(restr_key, &_Z_RC_IN_VAL(sub)->_key._inner)) {
             // Build the declare message to send on the wire
-            _z_wireexpr_t wireexpr = _z_declared_keyexpr_alias_to_wire(&_Z_RC_IN_VAL(sub)->_key, zn);
+            // A peer may receive this replay over a different reliable stream than the
+            // resource declarations above. Keep reconnect replay self-contained instead
+            // of depending on cross-stream ordering of a scoped wire expression.
+            _z_wireexpr_t wireexpr = _z_keyexpr_alias_to_wire(&_Z_RC_IN_VAL(sub)->_key._inner);
             _z_declaration_t declaration = _z_make_decl_subscriber(&wireexpr, _Z_RC_IN_VAL(sub)->_id);
             _z_network_message_t n_msg;
-            _z_n_msg_make_declare(&n_msg, declaration, _z_optional_id_make_some(interest_id));
+            _z_n_msg_make_declare(&n_msg, declaration, interest_id);
             z_result_t ret = _z_send_n_msg(zn, &n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, peer);
             _z_n_msg_clear(&n_msg);
             if (ret != _Z_RES_OK) {
@@ -89,7 +92,7 @@ static z_result_t _z_interest_send_decl_subscriber(_z_session_t *zn, uint32_t in
     return _Z_RES_OK;
 }
 #else
-static z_result_t _z_interest_send_decl_subscriber(_z_session_t *zn, uint32_t interest_id, void *peer,
+static z_result_t _z_interest_send_decl_subscriber(_z_session_t *zn, _z_optional_id_t interest_id, void *peer,
                                                    const _z_keyexpr_t *restr_key) {
     _ZP_UNUSED(zn);
     _ZP_UNUSED(interest_id);
@@ -100,7 +103,7 @@ static z_result_t _z_interest_send_decl_subscriber(_z_session_t *zn, uint32_t in
 #endif
 
 #if Z_FEATURE_QUERYABLE == 1
-static z_result_t _z_interest_send_decl_queryable(_z_session_t *zn, uint32_t interest_id, void *peer,
+static z_result_t _z_interest_send_decl_queryable(_z_session_t *zn, _z_optional_id_t interest_id, void *peer,
                                                   const _z_keyexpr_t *restr_key) {
     _Z_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn));
     _z_session_queryable_rc_slist_t *qle_list = _z_session_queryable_rc_slist_clone(zn->_local_queryable);
@@ -111,11 +114,11 @@ static z_result_t _z_interest_send_decl_queryable(_z_session_t *zn, uint32_t int
         // Check if key is concerned
         if (restr_key == NULL || _z_keyexpr_intersects(restr_key, &_Z_RC_IN_VAL(qle)->_key._inner)) {
             // Build the declare message to send on the wire
-            _z_wireexpr_t wireexpr = _z_declared_keyexpr_alias_to_wire(&_Z_RC_IN_VAL(qle)->_key, zn);
+            _z_wireexpr_t wireexpr = _z_keyexpr_alias_to_wire(&_Z_RC_IN_VAL(qle)->_key._inner);
             _z_declaration_t declaration = _z_make_decl_queryable(
                 &wireexpr, _Z_RC_IN_VAL(qle)->_id, _Z_RC_IN_VAL(qle)->_complete, _Z_QUERYABLE_DISTANCE_DEFAULT);
             _z_network_message_t n_msg;
-            _z_n_msg_make_declare(&n_msg, declaration, _z_optional_id_make_some(interest_id));
+            _z_n_msg_make_declare(&n_msg, declaration, interest_id);
             z_result_t ret = _z_send_n_msg(zn, &n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, peer);
             _z_n_msg_clear(&n_msg);
             if (ret != _Z_RES_OK) {
@@ -129,7 +132,7 @@ static z_result_t _z_interest_send_decl_queryable(_z_session_t *zn, uint32_t int
     return _Z_RES_OK;
 }
 #else
-static z_result_t _z_interest_send_decl_queryable(_z_session_t *zn, uint32_t interest_id, void *peer,
+static z_result_t _z_interest_send_decl_queryable(_z_session_t *zn, _z_optional_id_t interest_id, void *peer,
                                                   const _z_keyexpr_t *restr_key) {
     _ZP_UNUSED(zn);
     _ZP_UNUSED(interest_id);
@@ -140,7 +143,7 @@ static z_result_t _z_interest_send_decl_queryable(_z_session_t *zn, uint32_t int
 #endif
 
 #if Z_FEATURE_LIVELINESS == 1
-static z_result_t _z_interest_send_decl_token(_z_session_t *zn, uint32_t interest_id, void *peer,
+static z_result_t _z_interest_send_decl_token(_z_session_t *zn, _z_optional_id_t interest_id, void *peer,
                                               const _z_keyexpr_t *restr_key) {
     _Z_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn));
     _z_declared_keyexpr_intmap_t token_list = _z_declared_keyexpr_intmap_clone(&zn->_local_tokens);
@@ -153,10 +156,10 @@ static z_result_t _z_interest_send_decl_token(_z_session_t *zn, uint32_t interes
             _z_keyexpr_intersects(restr_key, &_z_declared_keyexpr_intmap_iterator_value(&iter)->_inner)) {
             // Build the declare message to send on the wire
             _z_wireexpr_t wireexpr =
-                _z_declared_keyexpr_alias_to_wire(_z_declared_keyexpr_intmap_iterator_value(&iter), zn);
+                _z_keyexpr_alias_to_wire(&_z_declared_keyexpr_intmap_iterator_value(&iter)->_inner);
             _z_declaration_t declaration = _z_make_decl_token(&wireexpr, id);
             _z_network_message_t n_msg;
-            _z_n_msg_make_declare(&n_msg, declaration, _z_optional_id_make_some(interest_id));
+            _z_n_msg_make_declare(&n_msg, declaration, interest_id);
             z_result_t ret = _z_send_n_msg(zn, &n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, peer);
             _z_n_msg_clear(&n_msg);
             if (ret != _Z_RES_OK) {
@@ -169,7 +172,7 @@ static z_result_t _z_interest_send_decl_token(_z_session_t *zn, uint32_t interes
     return _Z_RES_OK;
 }
 #else
-static z_result_t _z_interest_send_decl_token(_z_session_t *zn, uint32_t interest_id, void *peer,
+static z_result_t _z_interest_send_decl_token(_z_session_t *zn, _z_optional_id_t interest_id, void *peer,
                                               const _z_keyexpr_t *restr_key) {
     _ZP_UNUSED(zn);
     _ZP_UNUSED(interest_id);
@@ -192,11 +195,39 @@ static z_result_t _z_interest_send_declare_final(_z_session_t *zn, uint32_t inte
 }
 
 z_result_t _z_interest_push_declarations_to_peer(_z_session_t *zn, void *peer) {
-    _Z_RETURN_IF_ERR(_z_interest_send_decl_resource(zn, 0, peer, NULL));
-    _Z_RETURN_IF_ERR(_z_interest_send_decl_subscriber(zn, 0, peer, NULL));
-    _Z_RETURN_IF_ERR(_z_interest_send_decl_queryable(zn, 0, peer, NULL));
-    _Z_RETURN_IF_ERR(_z_interest_send_decl_token(zn, 0, peer, NULL));
-    _Z_RETURN_IF_ERR(_z_interest_send_declare_final(zn, 0, peer));
+    _z_optional_id_t no_interest = _z_optional_id_make_none();
+    _Z_RETURN_IF_ERR(_z_interest_send_decl_resource(zn, no_interest, peer, NULL));
+    _Z_RETURN_IF_ERR(_z_interest_send_decl_subscriber(zn, no_interest, peer, NULL));
+    _Z_RETURN_IF_ERR(_z_interest_send_decl_queryable(zn, no_interest, peer, NULL));
+    _Z_RETURN_IF_ERR(_z_interest_send_decl_token(zn, no_interest, peer, NULL));
+    return _Z_RES_OK;
+}
+
+z_result_t _z_interest_push_interests_to_peer(_z_session_t *zn, void *peer) {
+    _Z_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn));
+    _z_session_interest_rc_slist_t *intrs = _z_session_interest_rc_slist_clone(zn->_local_interests);
+    _z_session_mutex_unlock(zn);
+
+    _z_session_interest_rc_slist_t *xs = intrs;
+    while (xs != NULL) {
+        _z_session_interest_t *intr = _Z_RC_IN_VAL(_z_session_interest_rc_slist_value(xs));
+        // Rebuild the message from the canonical session state. The declaration cache
+        // contains the wire expression used by the previous peer and is not valid for
+        // a newly established face.
+        _z_wireexpr_t wireexpr = _z_keyexpr_alias_to_wire(&intr->_key);
+        _z_interest_t interest = _z_make_interest(&wireexpr, intr->_id, intr->_flags);
+        _z_network_message_t n_msg;
+        _z_n_msg_make_interest(&n_msg, interest);
+        z_result_t ret =
+            _z_send_n_msg(zn, &n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, peer);
+        _z_n_msg_clear(&n_msg);
+        if (ret != _Z_RES_OK) {
+            _z_session_interest_rc_slist_free(&intrs);
+            _Z_ERROR_RETURN(_Z_ERR_TRANSPORT_TX_FAILED);
+        }
+        xs = _z_session_interest_rc_slist_next(xs);
+    }
+    _z_session_interest_rc_slist_free(&intrs);
     return _Z_RES_OK;
 }
 
@@ -551,19 +582,19 @@ z_result_t _z_interest_process_interest(_z_session_t *zn, const _z_wireexpr_t *w
         // Send all declare
         if (ret == _Z_RES_OK && _Z_HAS_FLAG(flags, _Z_INTEREST_FLAG_KEYEXPRS)) {
             _Z_DEBUG("Sending declare resources");
-            ret = _z_interest_send_decl_resource(zn, id, NULL, restr_key_opt);
+            ret = _z_interest_send_decl_resource(zn, _z_optional_id_make_some(id), NULL, restr_key_opt);
         }
         if (ret == _Z_RES_OK && _Z_HAS_FLAG(flags, _Z_INTEREST_FLAG_SUBSCRIBERS)) {
             _Z_DEBUG("Sending declare subscribers");
-            ret = _z_interest_send_decl_subscriber(zn, id, NULL, restr_key_opt);
+            ret = _z_interest_send_decl_subscriber(zn, _z_optional_id_make_some(id), NULL, restr_key_opt);
         }
         if (ret == _Z_RES_OK && _Z_HAS_FLAG(flags, _Z_INTEREST_FLAG_QUERYABLES)) {
             _Z_DEBUG("Sending declare queryables");
-            ret = _z_interest_send_decl_queryable(zn, id, NULL, restr_key_opt);
+            ret = _z_interest_send_decl_queryable(zn, _z_optional_id_make_some(id), NULL, restr_key_opt);
         }
         if (ret == _Z_RES_OK && _Z_HAS_FLAG(flags, _Z_INTEREST_FLAG_TOKENS)) {
             _Z_DEBUG("Sending declare tokens");
-            ret = _z_interest_send_decl_token(zn, id, NULL, restr_key_opt);
+            ret = _z_interest_send_decl_token(zn, _z_optional_id_make_some(id), NULL, restr_key_opt);
         }
         // Send final declare
         _Z_SET_IF_OK(ret, _z_interest_send_declare_final(zn, id, NULL));

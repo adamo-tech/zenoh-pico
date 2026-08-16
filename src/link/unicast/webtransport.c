@@ -73,4 +73,6 @@ z_result_t _z_new_link_webtransport(_z_link_t *zl, _z_endpoint_t *endpoint) {
     zl->_read_socket_f = _z_f_link_webtransport_read_socket;
     return ret;
 }
+#else
+typedef int _zp_webtransport_link_disabled_t;
 #endif

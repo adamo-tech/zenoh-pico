@@ -242,8 +242,9 @@ z_result_t _z_new_peer(_z_transport_t *zt, const _z_id_t *session_id, const _z_s
             _z_transport_peer_unicast_t *peer = NULL;
             ret = _z_transport_peer_unicast_add(&zt->_transport._unicast, &tp_param, socket, true, &peer);
             if ((ret == _Z_RES_OK) && (peer != NULL)) {
-                (void)_z_interest_push_declarations_to_peer(
-                    _z_transport_common_get_session(&zt->_transport._unicast._common), &peer->common);
+                _z_session_t *session = _z_transport_common_get_session(&zt->_transport._unicast._common);
+                (void)_z_interest_push_declarations_to_peer(session, &peer->common);
+                (void)_z_interest_push_interests_to_peer(session, &peer->common);
             }
 #if Z_FEATURE_CONNECTIVITY == 1
             if ((ret == _Z_RES_OK) && (peer != NULL)) {

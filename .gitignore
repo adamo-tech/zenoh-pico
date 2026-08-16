@@ -1,6 +1,7 @@
 # CMake
 build
 build_default
+.build-wasm
 crossbuilds
 CMakeFiles
 compile_commands.json

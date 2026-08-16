@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "zenoh-pico/transport/utils.h"
 #include "zenoh-pico/utils/pointers.h"
 #include "zenoh-pico/utils/query_params.h"
 #include "zenoh-pico/utils/time_range.h"
@@ -106,6 +107,36 @@ static void test_query_params(void) {
 static bool compare_double_result(const double expected, const double result) {
     static const double EPSILON = 1e-6;
     return fabs(result - expected) < EPSILON;
+}
+
+static void test_sn_window(void) {
+    const _z_zint_t resolution = 16383;
+    _z_sn_window_t window;
+
+    _z_sn_window_reset(&window, 9);
+    assert(_z_sn_window_observe(&window, resolution, 10) == _Z_SN_WINDOW_AHEAD);
+    assert(_z_sn_window_observe(&window, resolution, 12) == _Z_SN_WINDOW_AHEAD);
+    assert(_z_sn_window_observe(&window, resolution, 11) == _Z_SN_WINDOW_REORDERED);
+    assert(_z_sn_window_observe(&window, resolution, 11) == _Z_SN_WINDOW_DUPLICATE);
+    assert(_z_sn_window_observe(&window, resolution, 12) == _Z_SN_WINDOW_DUPLICATE);
+
+    _z_sn_window_reset(&window, 0);
+    assert(_z_sn_window_observe(&window, resolution, 1) == _Z_SN_WINDOW_AHEAD);
+    assert(_z_sn_window_observe(&window, resolution, 66) == _Z_SN_WINDOW_AHEAD);
+    assert(_z_sn_window_observe(&window, resolution, 1) == _Z_SN_WINDOW_DUPLICATE);
+    assert(_z_sn_window_observe(&window, resolution, 131) == _Z_SN_WINDOW_AHEAD);
+    assert(_z_sn_window_observe(&window, resolution, 1) == _Z_SN_WINDOW_DUPLICATE);
+
+    _z_sn_window_reset(&window, 9);
+    assert(_z_sn_window_observe(&window, resolution, 300) == _Z_SN_WINDOW_AHEAD);
+    assert(_z_sn_window_observe(&window, resolution, 10) == _Z_SN_WINDOW_TOO_OLD);
+
+    const _z_zint_t rollover_resolution = 127;
+    _z_sn_window_reset(&window, rollover_resolution - 1);
+    assert(_z_sn_window_observe(&window, rollover_resolution, rollover_resolution) == _Z_SN_WINDOW_AHEAD);
+    assert(_z_sn_window_observe(&window, rollover_resolution, 1) == _Z_SN_WINDOW_AHEAD);
+    assert(_z_sn_window_observe(&window, rollover_resolution, 0) == _Z_SN_WINDOW_REORDERED);
+    assert(_z_sn_window_observe(&window, rollover_resolution, rollover_resolution) == _Z_SN_WINDOW_DUPLICATE);
 }
 
 static bool compare_time_range(const _z_time_range_t *a, const _z_time_range_t *b) {
@@ -394,6 +425,7 @@ static void test_time_range_contains_fully_bounded_mixed(void) {
 }
 
 int main(void) {
+    test_sn_window();
     test_query_params();
     test_time_range();
     test_time_range_contains_null_pointer();

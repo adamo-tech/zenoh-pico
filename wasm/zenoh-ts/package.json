@@ -1,0 +1,27 @@
+{
+  "name": "@adamo-tech/zenoh-pico-wasm",
+  "version": "1.9.0-webtransport.0",
+  "description": "Zenoh-Pico WebAssembly runtime with browser WebTransport support",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs"
+    }
+  },
+  "types": "./index.d.ts",
+  "files": [
+    "index.d.ts",
+    "index.mjs",
+    "zenoh-pico.mjs",
+    "zenoh-pico.wasm"
+  ],
+  "license": "Apache-2.0 OR EPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adamo-tech/zenoh-pico.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

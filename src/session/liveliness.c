@@ -40,27 +40,38 @@ z_result_t _z_liveliness_process_remote_token_declare(_z_session_t *zn, uint32_t
     _z_keyexpr_t ke;
     _Z_RETURN_IF_ERR(_z_get_keyexpr_from_wireexpr(zn, &ke, wireexpr, peer, false));
     z_result_t ret = _Z_RES_OK;
+    _z_keyexpr_t replaced_key = _z_keyexpr_null();
     _Z_CLEAN_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn), _z_keyexpr_clear(&ke));
 
-    const _z_keyexpr_t *pkeyexpr = _z_keyexpr_intmap_get(&zn->_remote_tokens, id);
+    _z_keyexpr_t *pkeyexpr = (_z_keyexpr_t *)_z_keyexpr_intmap_get(&zn->_remote_tokens, id);
     if (pkeyexpr != NULL) {
         // Already received this token
         _Z_DEBUG("Duplicate token id %i", (int)id);
-        ret = _z_keyexpr_equals(pkeyexpr, &ke) ? _Z_RES_OK : _Z_ERR_KEYEXPR_NOT_MATCH;
-        _z_session_mutex_unlock(zn);
-        _z_keyexpr_clear(&ke);
-        return ret;
-    } else {
-        _z_keyexpr_t *ke_on_heap = (_z_keyexpr_t *)z_malloc(sizeof(_z_keyexpr_t));
-        if (ke_on_heap == NULL || _z_keyexpr_intmap_insert(&zn->_remote_tokens, id, ke_on_heap) == NULL) {
-            ret = _Z_ERR_SYSTEM_OUT_OF_MEMORY;
-            z_free(ke_on_heap);
-        } else {
-            *ke_on_heap = _z_keyexpr_steal(&ke);
+        if (_z_keyexpr_equals(pkeyexpr, &ke)) {
+            _z_session_mutex_unlock(zn);
+            _z_keyexpr_clear(&ke);
+            return _Z_RES_OK;
         }
+        // Declaration ids are scoped to a transport face and may be reused
+        // after a reconnect. Replace the stale entry instead of treating the
+        // new router declaration as a fatal protocol violation.
+        replaced_key = _z_keyexpr_steal(pkeyexpr);
+        _z_keyexpr_intmap_remove(&zn->_remote_tokens, id);
+    }
+
+    _z_keyexpr_t *ke_on_heap = (_z_keyexpr_t *)z_malloc(sizeof(_z_keyexpr_t));
+    if (ke_on_heap == NULL || _z_keyexpr_intmap_insert(&zn->_remote_tokens, id, ke_on_heap) == NULL) {
+        ret = _Z_ERR_SYSTEM_OUT_OF_MEMORY;
+        z_free(ke_on_heap);
+    } else {
+        *ke_on_heap = _z_keyexpr_steal(&ke);
     }
 
     _z_session_mutex_unlock(zn);
+    if (_z_keyexpr_check(&replaced_key)) {
+        _Z_SET_IF_OK(ret, _z_trigger_liveliness_subscriptions_undeclare(zn, &replaced_key, timestamp));
+        _z_keyexpr_clear(&replaced_key);
+    }
     _z_wireexpr_t wireexpr2 = _z_wireexpr_alias(wireexpr);
     _Z_SET_IF_OK(ret, _z_trigger_liveliness_subscriptions_declare(zn, &wireexpr2, timestamp, peer));
     if (ret != _Z_RES_OK) {
@@ -219,8 +230,19 @@ z_result_t _z_liveliness_process_token_declare(_z_session_t *zn, const _z_n_msg_
                                                _z_transport_peer_common_t *peer) {
 #if Z_FEATURE_QUERY == 1
     if (decl->_interest_id.has_value) {
-        _z_liveliness_pending_query_reply(zn, decl->_interest_id.value, &decl->_decl._body._decl_token._keyexpr,
-                                          &decl->_ext_timestamp, peer);
+        z_result_t query_ret =
+            _z_liveliness_pending_query_reply(zn, decl->_interest_id.value,
+                                              &decl->_decl._body._decl_token._keyexpr,
+                                              &decl->_ext_timestamp, peer);
+        if (query_ret == _Z_RES_OK || query_ret == _Z_ERR_QUERY_NOT_MATCH) {
+            // A CURRENT-only liveliness query uses token declarations as
+            // replies. A router can send every current token under the same
+            // interest id; tokens outside this query's key expression are
+            // benign and must be ignored. None of these snapshots are
+            // persistent remote-token declarations.
+            return _Z_RES_OK;
+        }
+        if (query_ret != _Z_ERR_ENTITY_UNKNOWN) return query_ret;
     }
 #endif
 

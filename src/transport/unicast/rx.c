@@ -118,7 +118,18 @@ static z_result_t _z_unicast_handle_frame(_z_transport_unicast_t *ztu, uint8_t h
         }
     } else {
         tmsg_reliability = Z_RELIABILITY_BEST_EFFORT;
-        if (_z_sn_precedes(ztu->_common._sn_res, peer->_sn_rx_best_effort, msg->_sn)) {
+        if (ztu->_common._link->_cap._flow == Z_LINK_CAP_FLOW_DATAGRAM) {
+            const _z_sn_window_result_t result =
+                _z_sn_window_observe(&peer->_sn_rx_best_effort_window, ztu->_common._sn_res, msg->_sn);
+            if (result == _Z_SN_WINDOW_AHEAD) {
+                peer->_sn_rx_best_effort = msg->_sn;
+            } else if (result == _Z_SN_WINDOW_REORDERED) {
+                _Z_DEBUG("Accepting reordered best effort frame");
+            } else {
+                _Z_DEBUG("Best effort frame dropped because it is duplicate or outside the reorder window");
+                return _Z_RES_OK;
+            }
+        } else if (_z_sn_precedes(ztu->_common._sn_res, peer->_sn_rx_best_effort, msg->_sn)) {
             peer->_sn_rx_best_effort = msg->_sn;
         } else {
 #if Z_FEATURE_FRAGMENTATION == 1
@@ -174,6 +185,7 @@ static z_result_t _z_unicast_handle_fragment_inner(_z_transport_unicast_t *ztu, 
         if (_z_sn_precedes(ztu->_common._sn_res, peer->_sn_rx_best_effort, msg->_sn)) {
             consecutive = _z_sn_consecutive(ztu->_common._sn_res, peer->_sn_rx_best_effort, msg->_sn);
             peer->_sn_rx_best_effort = msg->_sn;
+            _z_sn_window_reset(&peer->_sn_rx_best_effort_window, msg->_sn);
             dbuf = &peer->common._dbuf_best_effort;
             dbuf_state = &peer->common._state_best_effort;
         } else {

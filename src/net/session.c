@@ -141,6 +141,22 @@ static z_result_t _z_open_inner(_z_session_rc_t *zs, _z_string_t *locator, const
     }
     _z_transport_get_common(&zn->_tp)->_session = _z_session_rc_clone_as_weak(zs);
     _z_transport_get_common(&zn->_tp)->_state = _Z_TRANSPORT_STATE_OPEN;
+    if (zn->_mode == Z_WHATAMI_CLIENT && zn->_tp._type == _Z_TRANSPORT_UNICAST_TYPE) {
+        _z_transport_unicast_t *ztu = &zn->_tp._transport._unicast;
+        _z_transport_peer_unicast_t *peer = _z_transport_peer_unicast_slist_value(ztu->_peers);
+        if (peer == NULL) {
+            _z_transport_clear(&zn->_tp);
+            return _Z_ERR_TRANSPORT_OPEN_FAILED;
+        }
+        ret = _z_interest_push_declarations_to_peer(zn, &peer->common);
+        if (ret == _Z_RES_OK) {
+            ret = _z_interest_push_interests_to_peer(zn, &peer->common);
+        }
+        if (ret != _Z_RES_OK) {
+            _z_transport_clear(&zn->_tp);
+            return ret;
+        }
+    }
 #if Z_FEATURE_MULTICAST_DECLARATIONS == 1
     if (zn->_tp._type == _Z_TRANSPORT_MULTICAST_TYPE) {
         ret = _z_interest_pull_resource_from_peers(zn);
@@ -583,24 +599,10 @@ _z_fut_fn_result_t _z_client_reopen_task_fn(void *ztc_arg, _z_executor_t *execut
         }
     }
 
+    // _z_open_inner() has rebuilt declarations and interests from current
+    // session state using IDs scoped to the new face. Cached messages contain
+    // IDs from the previous face and must never be replayed here.
     tc->_tasks = tasks_handles;
-    if (!_z_network_message_slist_is_empty(s->_declaration_cache)) {
-        _z_network_message_slist_t *iter = s->_declaration_cache;
-        while (iter != NULL) {
-            _z_network_message_t *n_msg = _z_network_message_slist_value(iter);
-            ret = _z_send_n_msg(s, n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, NULL);
-            if (ret != _Z_RES_OK) {
-                _Z_DEBUG("Send message during reopen failed: %i", ret);
-                _z_transport_clear(&s->_tp);
-                tc->_session = _z_session_rc_clone_as_weak(&zs);
-                tc->_state = _Z_TRANSPORT_STATE_RECONNECTING;
-                _z_session_rc_drop(&zs);
-                return _z_fut_fn_result_continue();
-            }
-
-            iter = _z_network_message_slist_next(iter);
-        }
-    }
     _z_session_rc_drop(&zs);
     _Z_DEBUG("Reconnected successfully");
     // Resume all sibling tasks that suspended themselves while waiting for reconnection.

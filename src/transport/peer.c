@@ -134,6 +134,7 @@ void _z_transport_peer_multicast_clear(_z_transport_peer_multicast_t *src) {
 void _z_transport_peer_multicast_copy(_z_transport_peer_multicast_t *dst, const _z_transport_peer_multicast_t *src) {
     dst->_sn_res = src->_sn_res;
     _z_conduit_sn_list_copy(&dst->_sn_rx_sns, &src->_sn_rx_sns);
+    dst->_sn_rx_best_effort_window = src->_sn_rx_best_effort_window;
     dst->_lease = src->_lease;
     _z_slice_copy(&dst->_remote_addr, &src->_remote_addr);
     _z_transport_peer_common_copy(&dst->common, &src->common);
@@ -163,6 +164,7 @@ void _z_transport_peer_unicast_clear(_z_transport_peer_unicast_t *src) {
 void _z_transport_peer_unicast_copy(_z_transport_peer_unicast_t *dst, const _z_transport_peer_unicast_t *src) {
     dst->_sn_rx_reliable = src->_sn_rx_reliable;
     dst->_sn_rx_best_effort = src->_sn_rx_best_effort;
+    dst->_sn_rx_best_effort_window = src->_sn_rx_best_effort_window;
     dst->_socket = src->_socket;
     dst->_owns_socket = false;  // Ownership is not copied
     dst->_pending = false;
@@ -212,6 +214,7 @@ z_result_t _z_transport_peer_unicast_add(_z_transport_unicast_t *ztu, _z_transpo
     _z_zint_t initial_sn_rx = _z_sn_decrement(ztu->_common._sn_res, param->_initial_sn_rx);
     peer->_sn_rx_reliable = initial_sn_rx;
     peer->_sn_rx_best_effort = initial_sn_rx;
+    _z_sn_window_reset(&peer->_sn_rx_best_effort_window, initial_sn_rx);
 
     peer->common._remote_zid = param->_remote_zid;
     peer->common._remote_whatami = param->_remote_whatami;

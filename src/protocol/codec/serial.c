@@ -105,8 +105,8 @@ size_t _z_serial_msg_deserialize(const uint8_t *src, size_t src_len, uint8_t *ds
         tmp_buf_ptr += wire_size;
     }
 
-    uint32_t received_crc =
-        (uint32_t)(tmp_buf_ptr[0] | (tmp_buf_ptr[1] << 8) | (tmp_buf_ptr[2] << 16) | (tmp_buf_ptr[3] << 24));
+    uint32_t received_crc = (uint32_t)tmp_buf_ptr[0] | ((uint32_t)tmp_buf_ptr[1] << 8) |
+                            ((uint32_t)tmp_buf_ptr[2] << 16) | ((uint32_t)tmp_buf_ptr[3] << 24);
 
     uint32_t computed_crc = _z_crc32(dst, wire_size);
     if (received_crc != computed_crc) {

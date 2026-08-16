@@ -32,3 +32,12 @@ jobs:
           mkdir build
           emcmake cmake -DBUILD_SHARED_LIBS=OFF -DCMAKE_C_STANDARD=11 -DBUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF -DBUILD_INTEGRATION=OFF -DBUILD_TOOLS=OFF -DZENOH_LOG=debug -DZ_FEATURE_LINK_WS=1 -DZ_FEATURE_LINK_TCP=0 -DZ_FEATURE_LINK_UDP_MULTICAST=0 -DZ_FEATURE_LINK_UDP_UNICAST=0 -DZ_FEATURE_SCOUTING=0 -H. -Bbuild
           make -C build
+      - name: Build WebTransport WASM distribution
+        run: ./wasm/build.sh
+      - name: Validate modular JavaScript wrapper
+        run: node --check dist-wasm/zenoh-ts/index.mjs
+      - name: Upload WebTransport WASM distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zenoh-pico-webtransport-wasm
+          path: dist-wasm/zenoh-ts/

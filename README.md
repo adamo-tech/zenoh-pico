@@ -34,7 +34,7 @@ Currently, zenoh-pico provides support for the following (RT)OSs and protocols:
 |     **ESP-IDF**       | UDP (unicast and multicast), TCP |      IPv4, IPv6     |               WiFi, Ethernet, Serial               |
 |      **MbedOS**       | UDP (unicast and multicast), TCP |      IPv4, IPv6     |               WiFi, Ethernet, Serial               |
 |      **OpenCR**       | UDP (unicast and multicast), TCP |         IPv4        |                        WiFi                        |
-|    **Emscripten**     |             Websocket            |      IPv4, IPv6     |                   WiFi, Ethernet                   |
+|    **Emscripten**     |       WebSocket, WebTransport     |      IPv4, IPv6     |                   WiFi, Ethernet                   |
 | **FreeRTOS-Plus-TCP** |         UDP (unicast), TCP       |         IPv4        |                      Ethernet                      |
 | **Raspberry Pi Pico** | UDP (unicast and multicast), TCP |         IPv4        |      WiFi (for "W" version), Serial, USB (CDC)     |
 
@@ -58,6 +58,39 @@ For other platforms - like RTOS for embedded systems / microcontrollers -, you w
 ## 2. How to build it
 
 For platform profiles and adding a new platform, see [docs/platforms.rst](docs/platforms.rst).
+
+### Browser WebTransport/WASM distribution
+
+Install and activate the Emscripten SDK, then run:
+
+```bash
+./wasm/build.sh
+```
+
+The reusable ES module, type declarations, and WASM binary are written to
+`dist-wasm/zenoh-ts/`. The module supports multiple client sessions, session
+put/delete/get, publishers, subscribers, queryables, liveliness, and publisher
+matching over a `webtransport/host:port` locator. Browser WebTransport requires
+HTTPS and a trusted server certificate or a SHA-256 certificate hash supplied
+when opening the session.
+
+```js
+import {createZenohPico} from "./dist-wasm/zenoh-ts/index.mjs";
+
+const pico = await createZenohPico({certificateHash: "base64-sha256-hash"});
+const session = await pico.open("webtransport/127.0.0.1:7448#tout=10000");
+const subscriber = await session.declareSubscriber("demo/**", console.log);
+await session.put("demo/example", new TextEncoder().encode("hello"));
+
+const queryable = await session.declareQueryable("demo/status", async query => {
+  await query.reply(new TextEncoder().encode("ready"));
+});
+for await (const reply of await session.get("demo/status", {timeoutMs: 1000})) {
+  const result = reply.result();
+  if (reply.isOk()) console.log(new TextDecoder().decode(result.payload));
+}
+await queryable.undeclare();
+```
 
 ### 2.1 Unix Environments
 
