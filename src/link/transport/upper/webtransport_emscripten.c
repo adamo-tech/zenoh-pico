@@ -10,6 +10,8 @@
 #include "zenoh-pico/link/transport/webtransport.h"
 #include "zenoh-pico/utils/pointers.h"
 
+// JavaScript macro bodies require JavaScript formatting, not C formatting.
+// clang-format off
 EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms), {
     if (typeof WebTransport === 'undefined') return -1;
     if (!globalThis.__zenohPicoWebTransport) {
@@ -30,7 +32,7 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
             }
         }
         if (Module.onZenohDiagnostic) {
-            Module.onZenohDiagnostic({type: 'webtransport', event: 'open-start', endpoint});
+            Module.onZenohDiagnostic({type: 'webtransport', event: 'open-start', endpoint: new URL(endpoint).origin});
         }
         const options = {};
         const hashBase64 = Module.zenohPicoServerCertificateHash;
@@ -79,9 +81,11 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
         if (transport) {
             try { transport.close(); } catch (_) {}
         }
-        if (Module.printErr) Module.printErr('WebTransport open failed: ' + String(error));
+        const diagnosticError = error instanceof Error ? error.name : 'WebTransportError';
+        const diagnosticEndpoint = endpoint.startsWith('https://') ? new URL(endpoint).origin : 'invalid endpoint';
+        if (Module.printErr) Module.printErr('WebTransport open failed at ' + diagnosticEndpoint + ': ' + diagnosticError);
         if (Module.onZenohDiagnostic) {
-            Module.onZenohDiagnostic({type: 'webtransport', event: 'open-failed', error: String(error)});
+            Module.onZenohDiagnostic({type: 'webtransport', event: 'open-failed', endpoint: diagnosticEndpoint, error: diagnosticError});
         }
         return -1;
     } finally {
@@ -299,6 +303,7 @@ EM_ASYNC_JS(void, _zp_webtransport_js_close, (int handle), {
         Module.onZenohDiagnostic({type: 'webtransport', event: 'close-complete', handle});
     }
 });
+// clang-format on
 
 z_result_t _z_webtransport_endpoint_init(_z_sys_net_endpoint_t *ep, const _z_string_t *address) {
     size_t len = _z_string_len(address);

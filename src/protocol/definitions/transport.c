@@ -34,7 +34,10 @@ void _z_t_msg_join_clear(_z_t_msg_join_t *msg) {
 
 void _z_t_msg_init_clear(_z_t_msg_init_t *msg) { _z_slice_clear(&msg->_cookie); }
 
-void _z_t_msg_open_clear(_z_t_msg_open_t *msg) { _z_slice_clear(&msg->_cookie); }
+void _z_t_msg_open_clear(_z_t_msg_open_t *msg) {
+    _z_slice_clear(&msg->_cookie);
+    _z_slice_clear(&msg->_signalling_token);
+}
 
 void _z_t_msg_close_clear(_z_t_msg_close_t *msg) { _ZP_UNUSED(msg); }
 
@@ -200,6 +203,7 @@ _z_transport_message_t _z_t_msg_make_open_syn(_z_zint_t lease, _z_zint_t initial
     msg._body._open._lease = lease;
     msg._body._open._initial_sn = initial_sn;
     msg._body._open._cookie = cookie;
+    msg._body._open._signalling_token = _z_slice_null();
 
     if ((lease % 1000) == 0) {
         _Z_SET_FLAG(msg._header, _Z_FLAG_T_OPEN_T);
@@ -216,6 +220,7 @@ _z_transport_message_t _z_t_msg_make_open_ack(_z_zint_t lease, _z_zint_t initial
     msg._body._open._lease = lease;
     msg._body._open._initial_sn = initial_sn;
     _z_slice_reset(&msg._body._open._cookie);
+    msg._body._open._signalling_token = _z_slice_null();
 
     if ((lease % 1000) == 0) {
         _Z_SET_FLAG(msg._header, _Z_FLAG_T_OPEN_T);
@@ -336,6 +341,7 @@ void _z_t_msg_copy_init(_z_t_msg_init_t *clone, _z_t_msg_init_t *msg) {
 void _z_t_msg_copy_open(_z_t_msg_open_t *clone, _z_t_msg_open_t *msg) {
     clone->_lease = msg->_lease;
     clone->_initial_sn = msg->_initial_sn;
+    _z_slice_copy(&clone->_signalling_token, &msg->_signalling_token);
     if (!_z_slice_is_empty(&msg->_cookie)) {
         _z_slice_copy(&clone->_cookie, &msg->_cookie);
     }

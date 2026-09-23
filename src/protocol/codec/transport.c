@@ -304,6 +304,18 @@ z_result_t _z_open_encode(_z_wbuf_t *wbf, uint8_t header, const _z_t_msg_open_t 
     return ret;
 }
 
+static z_result_t _z_open_decode_ext(_z_msg_ext_t *extension, void *ctx) {
+    _z_t_msg_open_t *msg = (_z_t_msg_open_t *)ctx;
+    if (_Z_EXT_FULL_ID(extension->_header) == 0x4e) {
+        _z_slice_t *token = &extension->_body._zbuf._val;
+        if (token->len == 0 || token->len > 4096 || !_z_slice_is_empty(&msg->_signalling_token)) {
+            return _Z_ERR_MESSAGE_DESERIALIZATION_FAILED;
+        }
+        return _z_slice_copy(&msg->_signalling_token, token);
+    }
+    return _Z_MSG_EXT_IS_MANDATORY(extension->_header) ? _Z_ERR_MESSAGE_EXTENSION_MANDATORY_AND_UNKNOWN : _Z_RES_OK;
+}
+
 z_result_t _z_open_decode(_z_t_msg_open_t *msg, _z_zbuf_t *zbf, uint8_t header) {
     _Z_DEBUG("Decoding _Z_MID_T_OPEN");
     z_result_t ret = _Z_RES_OK;
@@ -325,9 +337,10 @@ z_result_t _z_open_decode(_z_t_msg_open_t *msg, _z_zbuf_t *zbf, uint8_t header) 
         msg->_cookie = _z_slice_null();
     }
     if ((ret == _Z_RES_OK) && (_Z_HAS_FLAG(header, _Z_FLAG_T_Z) == true)) {
-        ret |= _z_msg_ext_skip_non_mandatories(zbf, 0x02);
+        ret |= _z_msg_ext_decode_iter(zbf, _z_open_decode_ext, msg);
     }
 
+    if (ret != _Z_RES_OK) _z_slice_clear(&msg->_signalling_token);
     return ret;
 }
 
