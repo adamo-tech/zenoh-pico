@@ -16,9 +16,20 @@ static void check(const uint8_t *bytes, size_t len, int valid, const char *token
         _z_t_msg_open_clear(&msg);
         assert(memcmp(copy._signalling_token.start, token, strlen(token)) == 0);
         _z_t_msg_open_clear(&copy);
-    } else _z_t_msg_open_clear(&msg);
+    } else {
+        if (!valid) assert(_z_slice_is_empty(&msg._signalling_token));
+        _z_t_msg_open_clear(&msg);
+    }
 }
 int main(void) {
+    // Outgoing handshakes never carry the server-issued capability. Constructors
+    // must initialize the new owning field before the generic clear path sees it.
+    _z_transport_message_t syn = _z_t_msg_make_open_syn(1000, 0, _z_slice_null());
+    _z_transport_message_t ack = _z_t_msg_make_open_ack(1000, 0);
+    assert(_z_slice_is_empty(&syn._body._open._signalling_token));
+    assert(_z_slice_is_empty(&ack._body._open._signalling_token));
+    _z_t_msg_clear(&syn);
+    _z_t_msg_clear(&ack);
     const uint8_t valid[] = {1,0,0x4e,3,'a','b','c'};
     const uint8_t empty[] = {1,0,0x4e,0};
     const uint8_t truncated[] = {1,0,0x4e,4,'a'};

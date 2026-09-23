@@ -79,7 +79,7 @@ async function createBinding(options) {
         // `new URL("zenoh-pico.wasm", import.meta.url)` reference to a hashed
         // production asset. A dynamic fallback here defeats that rewrite and
         // makes SPA hosts return index.html for the missing unhashed URL.
-        locateFile: options.locateFile ?? (path => path === "zenoh-pico.wasm" ? new URL("./zenoh-pico.wasm?v=d7eb77757e07b01d5505ef546aa6207cb0b65e08d1b279df087664d3c6609a05", import.meta.url).href : path),
+        locateFile: options.locateFile ?? (path => path === "zenoh-pico.wasm" ? new URL("./zenoh-pico.wasm?v=9f6adfdd42d206f9634313bbdba0c15bbddc3067651a23fd7a1e5fe5b2683af4", import.meta.url).href : path),
         zenohPicoReceiveBufferBytes: options.receiveBufferBytes,
         print: options.print,
         printErr: options.printErr,

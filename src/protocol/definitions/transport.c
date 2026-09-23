@@ -203,6 +203,7 @@ _z_transport_message_t _z_t_msg_make_open_syn(_z_zint_t lease, _z_zint_t initial
     msg._body._open._lease = lease;
     msg._body._open._initial_sn = initial_sn;
     msg._body._open._cookie = cookie;
+    msg._body._open._signalling_token = _z_slice_null();
 
     if ((lease % 1000) == 0) {
         _Z_SET_FLAG(msg._header, _Z_FLAG_T_OPEN_T);
@@ -219,6 +220,7 @@ _z_transport_message_t _z_t_msg_make_open_ack(_z_zint_t lease, _z_zint_t initial
     msg._body._open._lease = lease;
     msg._body._open._initial_sn = initial_sn;
     _z_slice_reset(&msg._body._open._cookie);
+    msg._body._open._signalling_token = _z_slice_null();
 
     if ((lease % 1000) == 0) {
         _Z_SET_FLAG(msg._header, _Z_FLAG_T_OPEN_T);
