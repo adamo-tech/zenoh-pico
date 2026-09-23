@@ -27,11 +27,11 @@
 
 #ifdef ZENOH_EMSCRIPTEN
 #include <emscripten.h>
-EM_JS(int, _z_wasm_owner_reconnect, (), {
+EM_JS(int, _z_wasm_owner_reconnect, (void), {
     if (!Module.zenohPicoOwnerReconnect) return 0;
     if (Module.onZenohSessionLost) Module.onZenohSessionLost();
     return 1;
-});
+})
 #endif
 
 #if Z_FEATURE_UNICAST_TRANSPORT == 1

@@ -10,6 +10,8 @@
 #include "zenoh-pico/link/transport/webtransport.h"
 #include "zenoh-pico/utils/pointers.h"
 
+// JavaScript macro bodies require JavaScript formatting, not C formatting.
+// clang-format off
 EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms), {
     if (typeof WebTransport === 'undefined') return -1;
     if (!globalThis.__zenohPicoWebTransport) {
@@ -301,6 +303,7 @@ EM_ASYNC_JS(void, _zp_webtransport_js_close, (int handle), {
         Module.onZenohDiagnostic({type: 'webtransport', event: 'close-complete', handle});
     }
 });
+// clang-format on
 
 z_result_t _z_webtransport_endpoint_init(_z_sys_net_endpoint_t *ep, const _z_string_t *address) {
     size_t len = _z_string_len(address);

@@ -35,7 +35,7 @@ EM_JS(void, _z_wasm_signalling_token, (const uint8_t *data, size_t len), {
     if (Module.onZenohSignallingToken) {
         Module.onZenohSignallingToken(UTF8ToString(data, len));
     }
-});
+})
 #endif
 
 #if Z_FEATURE_UNICAST_TRANSPORT == 1
@@ -214,8 +214,7 @@ static z_result_t _z_unicast_handshake_open(_z_transport_unicast_establish_param
     param->_initial_sn_rx = oam._body._open._initial_sn;
 #ifdef ZENOH_EMSCRIPTEN
     if (!_z_slice_is_empty(&oam._body._open._signalling_token)) {
-        _z_wasm_signalling_token(oam._body._open._signalling_token.start,
-                                oam._body._open._signalling_token.len);
+        _z_wasm_signalling_token(oam._body._open._signalling_token.start, oam._body._open._signalling_token.len);
     }
 #endif
     _z_t_msg_clear(&oam);

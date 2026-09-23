@@ -313,8 +313,7 @@ static z_result_t _z_open_decode_ext(_z_msg_ext_t *extension, void *ctx) {
         }
         return _z_slice_copy(&msg->_signalling_token, token);
     }
-    return _Z_MSG_EXT_IS_MANDATORY(extension->_header)
-        ? _Z_ERR_MESSAGE_EXTENSION_MANDATORY_AND_UNKNOWN : _Z_RES_OK;
+    return _Z_MSG_EXT_IS_MANDATORY(extension->_header) ? _Z_ERR_MESSAGE_EXTENSION_MANDATORY_AND_UNKNOWN : _Z_RES_OK;
 }
 
 z_result_t _z_open_decode(_z_t_msg_open_t *msg, _z_zbuf_t *zbf, uint8_t header) {
