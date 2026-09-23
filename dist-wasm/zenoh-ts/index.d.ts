@@ -11,6 +11,7 @@ export interface PicoRuntimeOptions {
 export interface PicoSessionOptions {
     certificateHash?: string;
     pollIntervalMs?: number;
+    reconnectOwner?: "transport" | "application";
     resolveWebTransportUrl?: (endpoint: string) => string | Promise<string>;
 }
 
@@ -51,6 +52,9 @@ export class PicoRuntime {
 
 export class PicoSession implements AsyncDisposable {
     readonly closed: boolean;
+    readonly signallingToken?: string;
+    onClosed(listener: () => void): () => void;
+    invalidate(): void;
     put(keyExpr: string, payload: Uint8Array | ArrayBuffer, options?: PicoQosOptions): Promise<void>;
     delete(keyExpr: string, options?: PicoQosOptions): Promise<void>;
     get(keyExpr: string, options?: PicoGetOptions): Promise<PicoReceiver<PicoReply>>;

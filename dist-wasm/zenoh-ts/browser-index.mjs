@@ -1,4 +1,4 @@
-import createZenohPicoModule from "./zenoh-pico.mjs?v=c11f4b4d59de7a289241f90135551b7d36dd1589aa97f6a60053bf996b5bcbf5";
+import createZenohPicoModule from "./zenoh-pico.mjs?v=52d7ef7520101a05de9af9f45038b8760e8d97e38268ee9b9e727fcc602e9872";
 
 function checkResult(operation, result) {
     if (result < 0) throw new Error(`${operation} failed with zenoh-pico error ${result}`);
@@ -72,16 +72,20 @@ async function createBinding(options) {
     };
     const performanceStats = {allocMs: 0, copyMs: 0, wasmCallMs: 0, byteCalls: 0, bytesCopied: 0};
     let transportWake = () => {};
+    let signallingToken;
+    let sessionLost = () => {};
     const module = await createZenohPicoModule({
         // Leave the default unset so bundlers can rewrite Emscripten's static
         // `new URL("zenoh-pico.wasm", import.meta.url)` reference to a hashed
         // production asset. A dynamic fallback here defeats that rewrite and
         // makes SPA hosts return index.html for the missing unhashed URL.
-        locateFile: options.locateFile ?? (path => path === "zenoh-pico.wasm" ? new URL("./zenoh-pico.wasm?v=d0e9be69d8cee5c6702357ab2f793f0f60a39d7e4404fe5ad58281f0803f866d", import.meta.url).href : path),
+        locateFile: options.locateFile ?? (path => path === "zenoh-pico.wasm" ? new URL("./zenoh-pico.wasm?v=d7eb77757e07b01d5505ef546aa6207cb0b65e08d1b279df087664d3c6609a05", import.meta.url).href : path),
         zenohPicoReceiveBufferBytes: options.receiveBufferBytes,
         print: options.print,
         printErr: options.printErr,
         onZenohDiagnostic: options.onDiagnostic,
+        onZenohSignallingToken(token) { signallingToken = token; },
+        onZenohSessionLost() { sessionLost(); },
         onZenohTransportData() { transportWake(); },
         onZenohSample(handle, keyExpr, payload, kind, metadata) {
             const timestamp = metadata.timestamp
@@ -155,6 +159,8 @@ async function createBinding(options) {
             pendingQueryEvents.delete(handle);
             if (receiver.closed) queryReceivers.delete(handle);
         },
+        get signallingToken() { return signallingToken; },
+        setSessionLost(callback) { sessionLost = callback; },
         performanceStats() { return {...performanceStats}; },
         setTransportWake(callback) { transportWake = callback; },
     };
@@ -180,6 +186,7 @@ class PicoRuntime {
         this.firstBinding = undefined;
         binding.module.zenohPicoResolveWebTransportUrl =
             options.resolveWebTransportUrl ?? this.options.resolveWebTransportUrl;
+        binding.module.zenohPicoOwnerReconnect = options.reconnectOwner === "application";
         const handle = checkResult("session open", await binding.call(
             "zt_session_open", "number", ["string", "string"],
             [endpoint, options.certificateHash ?? this.options.certificateHash ?? null],
@@ -196,10 +203,33 @@ export class PicoSession {
         this.handle = handle;
         this.pollIntervalMs = pollIntervalMs;
         this.closed = false;
+        this.closedListeners = new Set();
+        this.runtime.setSessionLost(() => this.invalidate());
         this.pollTimer = undefined;
         this.polling = false;
         this.pollRequested = false;
         this.runtime.setTransportWake(() => this.requestPoll());
+    }
+
+    get signallingToken() { return this.runtime.signallingToken; }
+
+    onClosed(listener) {
+        if (this.closed) { listener(); return () => {}; }
+        this.closedListeners.add(listener);
+        return () => this.closedListeners.delete(listener);
+    }
+
+    invalidate() {
+        if (this.closed) return;
+        this.closed = true;
+        if (this.pollTimer !== undefined) clearTimeout(this.pollTimer);
+        // Never enter native forceReconnect: the application owns replacement.
+        this.runtime.setTransportWake(() => {});
+        for (const listener of this.closedListeners) {
+            try { listener(); } catch { /* An observer cannot prevent cleanup. */ }
+        }
+        this.closedListeners.clear();
+        void this.close().catch(() => {});
     }
 
     startPolling() {
@@ -332,14 +362,17 @@ export class PicoSession {
 
     liveliness() { return new PicoLiveliness(this.runtime, this.handle); }
 
-    async close() {
-        if (this.closed) return;
-        this.closed = true;
-        this.runtime.setTransportWake(() => {});
-        if (this.pollTimer !== undefined) clearTimeout(this.pollTimer);
-        checkResult("session close", await this.runtime.call(
-            "zt_session_close", "number", ["number"], [this.handle],
-        ));
+    close() {
+        this.closePromise ??= (async () => {
+            this.closed = true;
+            this.closedListeners.clear();
+            this.runtime.setTransportWake(() => {});
+            if (this.pollTimer !== undefined) clearTimeout(this.pollTimer);
+            checkResult("session close", await this.runtime.call(
+                "zt_session_close", "number", ["number"], [this.handle],
+            ));
+        })();
+        return this.closePromise;
     }
 
     async [Symbol.asyncDispose]() { await this.close(); }

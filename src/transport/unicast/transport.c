@@ -28,6 +28,16 @@
 #include "zenoh-pico/transport/utils.h"
 #include "zenoh-pico/utils/logging.h"
 
+#ifdef ZENOH_EMSCRIPTEN
+#include <emscripten.h>
+EM_JS(void, _z_wasm_signalling_token, (const uint8_t *data, size_t len), {
+    // Called only after an accepted OpenAck. Never include capabilities in diagnostics.
+    if (Module.onZenohSignallingToken) {
+        Module.onZenohSignallingToken(UTF8ToString(data, len));
+    }
+});
+#endif
+
 #if Z_FEATURE_UNICAST_TRANSPORT == 1
 static z_result_t _z_unicast_transport_create_inner(_z_transport_unicast_t *ztu, _z_link_t *zl,
                                                     _z_transport_unicast_establish_param_t *param) {
@@ -194,7 +204,7 @@ static z_result_t _z_unicast_handshake_open(_z_transport_unicast_establish_param
     if ((_Z_MID(oam._header) != _Z_MID_T_OPEN) || !_Z_HAS_FLAG(oam._header, _Z_FLAG_T_OPEN_A)) {
         _z_t_msg_clear(&oam);
         _Z_ERROR_LOG(_Z_ERR_MESSAGE_UNEXPECTED);
-        ret = _Z_ERR_MESSAGE_UNEXPECTED;
+        return _Z_ERR_MESSAGE_UNEXPECTED;
     }
     // THIS LOG STRING USED IN TEST, change with caution
     _Z_DEBUG("Received Z_OPEN(Ack)");
@@ -202,6 +212,12 @@ static z_result_t _z_unicast_handshake_open(_z_transport_unicast_establish_param
     // The initial SN at RX side. Initialize the session as we had already received
     // a message with a SN equal to initial_sn - 1.
     param->_initial_sn_rx = oam._body._open._initial_sn;
+#ifdef ZENOH_EMSCRIPTEN
+    if (!_z_slice_is_empty(&oam._body._open._signalling_token)) {
+        _z_wasm_signalling_token(oam._body._open._signalling_token.start,
+                                oam._body._open._signalling_token.len);
+    }
+#endif
     _z_t_msg_clear(&oam);
     return _Z_RES_OK;
 }

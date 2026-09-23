@@ -25,6 +25,15 @@
 #include "zenoh-pico/transport/unicast/transport.h"
 #include "zenoh-pico/utils/logging.h"
 
+#ifdef ZENOH_EMSCRIPTEN
+#include <emscripten.h>
+EM_JS(int, _z_wasm_owner_reconnect, (), {
+    if (!Module.zenohPicoOwnerReconnect) return 0;
+    if (Module.onZenohSessionLost) Module.onZenohSessionLost();
+    return 1;
+});
+#endif
+
 #if Z_FEATURE_UNICAST_TRANSPORT == 1
 #if Z_FEATURE_UNICAST_PEER == 1
 static bool _zp_unicast_peer_is_expired(const _z_transport_peer_unicast_t *target,
@@ -74,6 +83,15 @@ z_result_t _zp_unicast_send_keep_alive(_z_transport_unicast_t *ztu) {
 
 _z_fut_fn_result_t _zp_unicast_failed_result(_z_transport_unicast_t *ztu, _z_executor_t *executor) {
     _z_session_t *zs = _z_transport_common_get_session(&ztu->_common);
+#ifdef ZENOH_EMSCRIPTEN
+    // One WASM instance owns one session. Its React owner may replace the entire
+    // session (including discovery declarations) instead of native auto-reopen.
+    if (_z_wasm_owner_reconnect()) {
+        _z_unicast_transport_close(ztu, _Z_CLOSE_EXPIRED);
+        ztu->_common._state = _Z_TRANSPORT_STATE_CLOSED;
+        return _z_fut_fn_result_ready();
+    }
+#endif
 #if Z_FEATURE_LIVELINESS == 1 && Z_FEATURE_SUBSCRIPTION == 1
     _z_liveliness_subscription_undeclare_all(zs);
 #endif

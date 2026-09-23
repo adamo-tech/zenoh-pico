@@ -369,6 +369,8 @@ typedef struct {
     _z_zint_t _lease;
     _z_zint_t _initial_sn;
     _z_slice_t _cookie;
+    // Optional Adamo OpenAck extension 0x4e; opaque, bounded capability.
+    _z_slice_t _signalling_token;
 } _z_t_msg_open_t;
 void _z_t_msg_open_clear(_z_t_msg_open_t *msg);
 
