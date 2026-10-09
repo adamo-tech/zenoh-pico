@@ -146,6 +146,13 @@ static z_result_t _z_unicast_handle_frame(_z_transport_unicast_t *ztu, uint8_t h
     _z_network_message_t curr_nmsg = {0};
     _z_arc_slice_t arcs = _z_arc_slice_empty();
     while (_z_zbuf_len(msg->_payload) > 0) {
+        // Frames have no payload length. A transport header ends this frame
+        // and belongs to the outer batch decoder, not the network decoder.
+        // Keep malformed network messages on the normal error path.
+        uint8_t next = _z_zbuf_get(msg->_payload, _z_zbuf_get_rpos(msg->_payload));
+        if (_Z_MID(next) <= _Z_MID_T_JOIN) {
+            break;
+        }
         _Z_RETURN_IF_ERR(_z_network_message_decode(&curr_nmsg, msg->_payload, &arcs, (uintptr_t)&peer->common));
         curr_nmsg._reliability = tmsg_reliability;
         _Z_RETURN_IF_ERR(_z_handle_network_message(&ztu->_common, &curr_nmsg, &peer->common));

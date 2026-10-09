@@ -564,6 +564,18 @@ _z_fut_fn_result_t _z_client_reopen_task_fn(void *ztc_arg, _z_executor_t *execut
     }
     _z_session_transport_mutex_lock(s);
     z_result_t ret = _z_open(&zs, &s->_config, &s->_local_zid);
+    if (ret == _Z_RES_OK) {
+        // Client reconnect creates a new transport; it does not go through
+        // _z_new_peer(), which performs replay for peer-mode connections.
+        // Rebuild from live state so old peer-scoped wire IDs are not reused.
+        ret = _z_interest_push_declarations_to_peer(s, NULL);
+        if (ret == _Z_RES_OK) {
+            ret = _z_interest_push_interests_to_peer(s, NULL);
+        }
+        if (ret != _Z_RES_OK) {
+            _z_transport_clear(&s->_tp);
+        }
+    }
     _z_session_transport_mutex_unlock(s);
     if (ret != _Z_RES_OK) {
         if (ret == _Z_ERR_TRANSPORT_OPEN_FAILED || ret == _Z_ERR_SCOUT_NO_RESULTS ||
@@ -583,9 +595,6 @@ _z_fut_fn_result_t _z_client_reopen_task_fn(void *ztc_arg, _z_executor_t *execut
         }
     }
 
-    // _z_new_peer() has already rebuilt declarations and interests from the
-    // current session state. Cached messages contain peer-scoped wire-expression
-    // IDs from the previous face and must never be replayed on this connection.
     tc->_tasks = tasks_handles;
     _z_session_rc_drop(&zs);
     _Z_DEBUG("Reconnected successfully");

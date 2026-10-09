@@ -11,7 +11,7 @@
 #include "zenoh-pico/utils/pointers.h"
 
 EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms), {
-    if (typeof WebTransport === 'undefined') return -1;
+    if (typeof WebTransport === "undefined") return -1;
     if (!globalThis.__zenohPicoWebTransport) {
         globalThis.__zenohPicoWebTransport = { next: 1, links: new Map() };
     }
@@ -20,29 +20,43 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
     let transport = null;
     let timeoutId = null;
     try {
-        // Resolve immediately before every physical connection attempt. Zenoh-
-        // Pico may reopen a link internally, so embedding a one-use credential
-        // in the configured locator would replay it on reconnect.
+        // Resolve each physical connection with a fresh one-use credential.
         if (Module.zenohPicoResolveWebTransportUrl) {
             endpoint = await Module.zenohPicoResolveWebTransportUrl(endpoint);
-            if (typeof endpoint !== 'string' || !endpoint.startsWith('https://')) {
-                throw new TypeError('WebTransport URL resolver must return an https:// URL');
+            if (
+                typeof endpoint !== "string" ||
+                !endpoint.startsWith("https://")
+            ) {
+                throw new TypeError(
+                    "WebTransport URL resolver must return an https:// URL",
+                );
             }
+        }
+        // Never expose the resolved URL: its query contains an admission ticket.
+        if (Module.onZenohDiagnostic) {
+            Module.onZenohDiagnostic({
+                type: "webtransport",
+                event: "open-start",
+                endpoint: new URL(endpoint).origin,
+            });
         }
         const options = {};
         const hashBase64 = Module.zenohPicoServerCertificateHash;
         if (hashBase64) {
             const raw = atob(hashBase64);
-            options.serverCertificateHashes = [{
-                algorithm: 'sha-256',
-                value: Uint8Array.from(raw, c => c.charCodeAt(0)),
-            }];
+            options.serverCertificateHashes = [
+                {
+                    algorithm: "sha-256",
+                    value: Uint8Array.from(raw, (c) => c.charCodeAt(0)),
+                },
+            ];
         }
         transport = new WebTransport(endpoint, options);
         const timeout = new Promise((_, reject) => {
             timeoutId = setTimeout(
-                () => reject(new Error('WebTransport open timeout')),
-                timeout_ms);
+                () => reject(new Error("WebTransport open timeout")),
+                timeout_ms,
+            );
         });
         await Promise.race([transport.ready, timeout]);
         const handle = registry.next++;
@@ -60,19 +74,49 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
             readPump: null,
             dataSignal: null,
             dataSignalResolve: null,
-            maxIncomingBytes: Math.max(65536, Module.zenohPicoReceiveBufferBytes || 8 * 1024 * 1024),
+            maxIncomingBytes: Math.max(
+                65536,
+                Module.zenohPicoReceiveBufferBytes || 8 * 1024 * 1024,
+            ),
+            writeTimeoutMs: timeout_ms,
             spaceSignal: null,
             spaceSignalResolve: null,
-            stats: {readCalls: 0, readBytes: 0, writeCalls: 0, writeBytes: 0},
+            stats: { readCalls: 0, readBytes: 0, writeCalls: 0, writeBytes: 0 },
         });
+        if (Module.onZenohDiagnostic) {
+            Module.onZenohDiagnostic({
+                type: "webtransport",
+                event: "open-ready",
+                handle,
+            });
+        }
         return handle;
     } catch (error) {
-        // A failed resolver or handshake must not leave a transport or a
-        // rejecting timer alive after this Asyncify call has returned.
         if (transport) {
-            try { transport.close(); } catch (_) {}
+            try {
+                transport.close();
+            } catch (_) {}
         }
-        if (Module.printErr) Module.printErr('WebTransport open failed: ' + String(error));
+        const diagnosticError =
+            error instanceof Error ? error.name : "WebTransportError";
+        const diagnosticEndpoint = endpoint.startsWith("https://")
+            ? new URL(endpoint).origin
+            : "invalid endpoint";
+        if (Module.printErr)
+            Module.printErr(
+                "WebTransport open failed at " +
+                    diagnosticEndpoint +
+                    ": " +
+                    diagnosticError,
+            );
+        if (Module.onZenohDiagnostic) {
+            Module.onZenohDiagnostic({
+                type: "webtransport",
+                event: "open-failed",
+                endpoint: diagnosticEndpoint,
+                error: diagnosticError,
+            });
+        }
         return -1;
     } finally {
         if (timeoutId !== null) clearTimeout(timeoutId);
@@ -84,9 +128,13 @@ EM_ASYNC_JS(int, _zp_webtransport_js_read, (int handle, uint8_t *dst, size_t len
     if (!link) return -1;
     if (link.incomingBytes === 0 && !link.closed) {
         if (!link.dataSignal) {
-            link.dataSignal = new Promise(resolve => { link.dataSignalResolve = resolve; });
+            link.dataSignal = new Promise((resolve) => {
+                link.dataSignalResolve = resolve;
+            });
         }
-        const timeout = new Promise(resolve => setTimeout(resolve, timeout_ms));
+        const timeout = new Promise((resolve) =>
+            setTimeout(resolve, timeout_ms),
+        );
         await Promise.race([link.dataSignal, timeout]);
     }
     if (link.incomingBytes === 0) return link.closed ? -1 : 0;
@@ -96,7 +144,10 @@ EM_ASYNC_JS(int, _zp_webtransport_js_read, (int handle, uint8_t *dst, size_t len
         const chunk = link.incoming[0];
         const available = chunk.length - link.incomingOffset;
         const count = Math.min(wanted - copied, available);
-        HEAPU8.set(chunk.subarray(link.incomingOffset, link.incomingOffset + count), dst + copied);
+        HEAPU8.set(
+            chunk.subarray(link.incomingOffset, link.incomingOffset + count),
+            dst + copied,
+        );
         copied += count;
         link.incomingOffset += count;
         link.incomingBytes -= count;
@@ -105,7 +156,10 @@ EM_ASYNC_JS(int, _zp_webtransport_js_read, (int handle, uint8_t *dst, size_t len
             link.incomingOffset = 0;
         }
     }
-    if (link.spaceSignalResolve && link.incomingBytes < link.maxIncomingBytes / 2) {
+    if (
+        link.spaceSignalResolve &&
+        link.incomingBytes < link.maxIncomingBytes / 2
+    ) {
         link.spaceSignalResolve();
         link.spaceSignal = null;
         link.spaceSignalResolve = null;
@@ -117,18 +171,27 @@ EM_ASYNC_JS(int, _zp_webtransport_js_read, (int handle, uint8_t *dst, size_t len
 
 EM_JS(int, _zp_webtransport_js_read_nonblocking, (int handle, uint8_t *dst, size_t len), {
     const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
-    // Match the streamed-socket contract used by Pico's unicast read task:
-    // zero means EOF/closed, while -1 maps to SIZE_MAX and means that a
-    // non-blocking read has no data available yet.
     if (!link) return 0;
     if (link.incomingBytes === 0) return link.closed ? 0 : -1;
+    if (len === 0 && Module.onZenohDiagnostic) {
+        Module.onZenohDiagnostic({
+            type: "webtransport",
+            event: "zero-length-read",
+            handle,
+            queuedBytes: link.incomingBytes,
+            stats: { ...link.stats },
+        });
+    }
     const wanted = Math.min(len, link.incomingBytes);
     let copied = 0;
     while (copied < wanted) {
         const chunk = link.incoming[0];
         const available = chunk.length - link.incomingOffset;
         const count = Math.min(wanted - copied, available);
-        HEAPU8.set(chunk.subarray(link.incomingOffset, link.incomingOffset + count), dst + copied);
+        HEAPU8.set(
+            chunk.subarray(link.incomingOffset, link.incomingOffset + count),
+            dst + copied,
+        );
         copied += count;
         link.incomingOffset += count;
         link.incomingBytes -= count;
@@ -137,7 +200,10 @@ EM_JS(int, _zp_webtransport_js_read_nonblocking, (int handle, uint8_t *dst, size
             link.incomingOffset = 0;
         }
     }
-    if (link.spaceSignalResolve && link.incomingBytes < link.maxIncomingBytes / 2) {
+    if (
+        link.spaceSignalResolve &&
+        link.incomingBytes < link.maxIncomingBytes / 2
+    ) {
         link.spaceSignalResolve();
         link.spaceSignal = null;
         link.spaceSignalResolve = null;
@@ -150,6 +216,7 @@ EM_JS(int, _zp_webtransport_js_read_nonblocking, (int handle, uint8_t *dst, size
 EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, size_t len), {
     const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
     if (!link) return -1;
+    let timeoutId = null;
     try {
         if (!link.writer) {
             const stream = await link.streamPromise;
@@ -160,43 +227,101 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
                     for (;;) {
                         if (link.incomingBytes >= link.maxIncomingBytes) {
                             if (!link.spaceSignal) {
-                                link.spaceSignal = new Promise(resolve => { link.spaceSignalResolve = resolve; });
+                                link.spaceSignal = new Promise((resolve) => {
+                                    link.spaceSignalResolve = resolve;
+                                });
                             }
                             await link.spaceSignal;
                         }
                         const result = await link.reader.read();
-                        if (result.done) break;
+                        if (result.done) {
+                            if (Module.onZenohDiagnostic) {
+                                Module.onZenohDiagnostic({
+                                    type: "webtransport",
+                                    event: "read-pump-done",
+                                    handle,
+                                    stats: { ...link.stats },
+                                    queuedBytes: link.incomingBytes,
+                                });
+                            }
+                            break;
+                        }
                         if (result.value?.length) {
                             link.incoming.push(result.value);
                             link.incomingBytes += result.value.length;
                             if (Module.onZenohTransportData) {
-                                Module.onZenohTransportData(handle, result.value.length);
+                                Module.onZenohTransportData(
+                                    handle,
+                                    result.value.length,
+                                );
                             }
-                            if (link.dataSignalResolve) link.dataSignalResolve();
+                            if (link.dataSignalResolve)
+                                link.dataSignalResolve();
                             link.dataSignal = null;
                             link.dataSignalResolve = null;
                         }
                     }
-                } catch (_) {
-                    // The transport's closed promise carries the detailed error.
+                } catch (error) {
+                    if (Module.onZenohDiagnostic) {
+                        Module.onZenohDiagnostic({
+                            type: "webtransport",
+                            event: "read-pump-failed",
+                            handle,
+                            error: String(error),
+                            stats: { ...link.stats },
+                            queuedBytes: link.incomingBytes,
+                        });
+                    }
                 } finally {
                     link.closed = true;
-                    if (Module.onZenohTransportData) Module.onZenohTransportData(handle, 0);
+                    if (Module.onZenohTransportData)
+                        Module.onZenohTransportData(handle, 0);
                     if (link.dataSignalResolve) link.dataSignalResolve();
                     if (link.spaceSignalResolve) link.spaceSignalResolve();
                 }
             })();
-            link.transport.closed.catch(() => {}).finally(() => {
-                link.closed = true;
-                if (link.dataSignalResolve) link.dataSignalResolve();
-                if (link.spaceSignalResolve) link.spaceSignalResolve();
-            });
+            link.transport.closed
+                .then(
+                    (closeInfo) => {
+                        if (Module.onZenohDiagnostic) {
+                            Module.onZenohDiagnostic({
+                                type: "webtransport",
+                                event: "transport-closed",
+                                handle,
+                                closeInfo,
+                                stats: { ...link.stats },
+                                queuedBytes: link.incomingBytes,
+                            });
+                        }
+                    },
+                    (error) => {
+                        if (Module.onZenohDiagnostic) {
+                            Module.onZenohDiagnostic({
+                                type: "webtransport",
+                                event: "transport-failed",
+                                handle,
+                                error: String(error),
+                                stats: { ...link.stats },
+                                queuedBytes: link.incomingBytes,
+                            });
+                        }
+                    },
+                )
+                .finally(() => {
+                    link.closed = true;
+                    if (link.dataSignalResolve) link.dataSignalResolve();
+                    if (link.spaceSignalResolve) link.spaceSignalResolve();
+                });
         }
         if (link.closed || link.writeError) return -1;
         const bytes = HEAPU8.slice(src, src + len);
-        // Await acceptance so Pico never observes a successful reliable write
-        // that the browser has already rejected.
-        await link.writer.write(bytes);
+        const timeout = new Promise((_, reject) => {
+            timeoutId = setTimeout(
+                () => reject(new Error("WebTransport write timeout")),
+                link.writeTimeoutMs,
+            );
+        });
+        await Promise.race([link.writer.write(bytes), timeout]);
         link.stats.writeCalls++;
         link.stats.writeBytes += len;
         return len;
@@ -204,7 +329,17 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
         link.lastError = String(error);
         link.writeError = true;
         link.closed = true;
+        if (Module.onZenohDiagnostic) {
+            Module.onZenohDiagnostic({
+                type: "webtransport",
+                event: "write-failed",
+                handle,
+                error: link.lastError,
+            });
+        }
         return -1;
+    } finally {
+        if (timeoutId !== null) clearTimeout(timeoutId);
     }
 });
 
@@ -212,17 +347,46 @@ EM_ASYNC_JS(void, _zp_webtransport_js_close, (int handle), {
     const registry = globalThis.__zenohPicoWebTransport;
     const link = registry?.links.get(handle);
     if (!link) return;
-    try {
-        if (link.writer) {
-            await Promise.race([
-                link.writer.close(),
-                new Promise(resolve => setTimeout(resolve, 1000)),
-            ]);
-        }
-    } catch (_) {}
-    if (link.reader) await link.reader.cancel().catch(() => {});
-    try { link.transport.close(); } catch (_) {}
+    if (Module.onZenohDiagnostic) {
+        Module.onZenohDiagnostic({
+            type: "webtransport",
+            event: "close-start",
+            handle,
+            stats: { ...link.stats },
+            queuedBytes: link.incomingBytes,
+            writeError: link.writeError,
+            lastError: link.lastError,
+        });
+    }
     registry.links.delete(handle);
+    link.closed = true;
+    if (link.dataSignalResolve) link.dataSignalResolve();
+    if (link.spaceSignalResolve) link.spaceSignalResolve();
+    try {
+        link.transport.close();
+    } catch (_) {}
+    const cleanup = [];
+    try {
+        if (link.writer)
+            cleanup.push(Promise.resolve(link.writer.close()).catch(() => {}));
+    } catch (_) {}
+    try {
+        if (link.reader)
+            cleanup.push(Promise.resolve(link.reader.cancel()).catch(() => {}));
+    } catch (_) {}
+    if (cleanup.length) {
+        await Promise.race([
+            Promise.allSettled(cleanup),
+            new Promise((resolve) => setTimeout(resolve, 250)),
+        ]);
+    }
+    if (Module.onZenohDiagnostic) {
+        Module.onZenohDiagnostic({
+            type: "webtransport",
+            event: "close-complete",
+            handle,
+        });
+    }
 });
 
 z_result_t _z_webtransport_endpoint_init(_z_sys_net_endpoint_t *ep, const _z_string_t *address) {
