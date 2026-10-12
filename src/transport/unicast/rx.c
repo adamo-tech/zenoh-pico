@@ -118,7 +118,8 @@ static z_result_t _z_unicast_handle_frame(_z_transport_unicast_t *ztu, uint8_t h
         }
     } else {
         tmsg_reliability = Z_RELIABILITY_BEST_EFFORT;
-        if (ztu->_common._link->_cap._flow == Z_LINK_CAP_FLOW_DATAGRAM) {
+        if (ztu->_common._link->_cap._flow == Z_LINK_CAP_FLOW_DATAGRAM ||
+            ztu->_common._link->_type == _Z_LINK_TYPE_WEBTRANSPORT) {
             const _z_sn_window_result_t result =
                 _z_sn_window_observe(&peer->_sn_rx_best_effort_window, ztu->_common._sn_res, msg->_sn);
             if (result == _Z_SN_WINDOW_AHEAD) {

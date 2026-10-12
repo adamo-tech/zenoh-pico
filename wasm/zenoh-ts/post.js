@@ -14,6 +14,13 @@ Module["getZenohTransportStats"] = () => {
             lastError: link.lastError,
         }));
 };
+Module["hasZenohDatagramPath"] = () => {
+    const links = globalThis.__zenohPicoWebTransport?.links;
+    if (!links) return false;
+    return Array.from(links.values()).some(
+        (link) => link.owner === Module && !link.closed && link.datagramMtu > 0,
+    );
+};
 Module["getZenohMemoryStats"] = () => {
     const links = globalThis.__zenohPicoWebTransport?.links;
     return {

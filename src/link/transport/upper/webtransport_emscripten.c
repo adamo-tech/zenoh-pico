@@ -40,6 +40,7 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
                 endpoint: new URL(endpoint).origin,
             });
         }
+        const requestsDatagrams = "datagrams" in WebTransport.prototype;
         const options = {};
         const hashBase64 = Module.zenohPicoServerCertificateHash;
         if (hashBase64) {
@@ -51,7 +52,12 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
                 },
             ];
         }
-        transport = new WebTransport(endpoint, options);
+        transport = new WebTransport(
+            requestsDatagrams
+                ? endpoint + (endpoint.includes("?") ? "&" : "?") + "mixed_rel=1"
+                : endpoint,
+            options,
+        );
         const timeout = new Promise((_, reject) => {
             timeoutId = setTimeout(
                 () => reject(new Error("WebTransport open timeout")),
@@ -60,7 +66,7 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
         });
         await Promise.race([transport.ready, timeout]);
         const handle = registry.next++;
-        registry.links.set(handle, {
+        const link = {
             owner: Module,
             transport,
             streamPromise: transport.createBidirectionalStream(),
@@ -69,6 +75,13 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
             incoming: [],
             incomingOffset: 0,
             incomingBytes: 0,
+            streamChunks: [],
+            streamBytes: 0,
+            streamNeed: 2,
+            datagramWriter: null,
+            datagramQueuedBytes: 0,
+            datagramMtu: 0,
+            datagramIdle: true,
             closed: false,
             writeError: false,
             readPump: null,
@@ -81,8 +94,96 @@ EM_ASYNC_JS(int, _zp_webtransport_js_open, (const char *url, uint32_t timeout_ms
             writeTimeoutMs: timeout_ms,
             spaceSignal: null,
             spaceSignalResolve: null,
-            stats: { readCalls: 0, readBytes: 0, writeCalls: 0, writeBytes: 0 },
-        });
+            stats: {
+                readCalls: 0,
+                readBytes: 0,
+                writeCalls: 0,
+                writeBytes: 0,
+                datagramsSent: 0,
+                datagramsReceived: 0,
+                datagramsDropped: 0,
+                maxDatagramSize: 0,
+            },
+        };
+        link.deliver = (batch) => {
+            link.incoming.push(batch);
+            link.incomingBytes += batch.length;
+            if (Module.onZenohTransportData) {
+                Module.onZenohTransportData(handle, batch.length);
+            }
+            if (link.dataSignalResolve) link.dataSignalResolve();
+            link.dataSignal = null;
+            link.dataSignalResolve = null;
+        };
+        link.receiveStream = (chunk) => {
+            link.streamChunks.push(chunk);
+            link.streamBytes += chunk.length;
+            if (link.streamBytes < link.streamNeed) return;
+            let bytes = chunk;
+            if (link.streamChunks.length > 1) {
+                bytes = new Uint8Array(link.streamBytes);
+                let offset = 0;
+                for (const piece of link.streamChunks) {
+                    bytes.set(piece, offset);
+                    offset += piece.length;
+                }
+            }
+            let end = 0;
+            while (bytes.length - end >= 2) {
+                const next = end + 2 + (bytes[end] | (bytes[end + 1] << 8));
+                if (next > bytes.length) break;
+                end = next;
+            }
+            const rest = bytes.subarray(end);
+            link.streamChunks = rest.length ? [rest] : [];
+            link.streamBytes = rest.length;
+            link.streamNeed = rest.length >= 2 ? 2 + (rest[0] | (rest[1] << 8)) : 2;
+            if (end) link.deliver(bytes.subarray(0, end));
+        };
+        registry.links.set(handle, link);
+        if (requestsDatagrams) {
+            const writable = transport.datagrams.createWritable
+                ? transport.datagrams.createWritable()
+                : transport.datagrams.writable;
+            link.datagramWriter = writable.getWriter();
+            (async () => {
+                const reader = transport.datagrams.readable.getReader();
+                for (;;) {
+                    const result = await reader.read();
+                    if (result.done) break;
+                    if (link.incomingBytes >= link.maxIncomingBytes) {
+                        link.stats.datagramsDropped++;
+                        continue;
+                    }
+                    const batch = new Uint8Array(result.value.length + 2);
+                    batch[0] = result.value.length & 0xff;
+                    batch[1] = result.value.length >> 8;
+                    batch.set(result.value, 2);
+                    link.stats.datagramsReceived++;
+                    link.deliver(batch);
+                }
+            })().catch(() => {});
+            (async () => {
+                const streams = transport.incomingUnidirectionalStreams.getReader();
+                const acknowledgement = await streams.read();
+                const bytes = new Uint8Array(
+                    await new Response(acknowledgement.value).arrayBuffer(),
+                );
+                link.datagramMtu = Math.min(
+                    bytes[0] | (bytes[1] << 8),
+                    transport.datagrams.maxDatagramSize,
+                );
+                link.stats.maxDatagramSize = link.datagramMtu;
+                if (Module.onZenohDiagnostic) {
+                    Module.onZenohDiagnostic({
+                        type: "webtransport",
+                        event: "datagrams-ready",
+                        handle,
+                        maxDatagramSize: link.datagramMtu,
+                    });
+                }
+            })().catch(() => {});
+        }
         if (Module.onZenohDiagnostic) {
             Module.onZenohDiagnostic({
                 type: "webtransport",
@@ -247,18 +348,7 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
                             break;
                         }
                         if (result.value?.length) {
-                            link.incoming.push(result.value);
-                            link.incomingBytes += result.value.length;
-                            if (Module.onZenohTransportData) {
-                                Module.onZenohTransportData(
-                                    handle,
-                                    result.value.length,
-                                );
-                            }
-                            if (link.dataSignalResolve)
-                                link.dataSignalResolve();
-                            link.dataSignal = null;
-                            link.dataSignalResolve = null;
+                            link.receiveStream(result.value);
                         }
                     }
                 } catch (error) {
@@ -341,6 +431,40 @@ EM_ASYNC_JS(int, _zp_webtransport_js_write, (int handle, const uint8_t *src, siz
     } finally {
         if (timeoutId !== null) clearTimeout(timeoutId);
     }
+});
+
+EM_JS(int, _zp_webtransport_js_datagram_mtu, (int handle), {
+    const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
+    return link && !link.closed ? link.datagramMtu : 0;
+});
+
+EM_JS(int, _zp_webtransport_js_datagram_idle, (int handle), {
+    const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
+    if (!link || link.closed || !link.datagramMtu) return 0;
+    const idle = link.datagramIdle;
+    link.datagramIdle = true;
+    return idle ? 1 : 0;
+});
+
+EM_JS(void, _zp_webtransport_js_write_datagram, (int handle, const uint8_t *src, size_t len, int priority), {
+    const link = globalThis.__zenohPicoWebTransport?.links.get(handle);
+    if (!link || link.closed) return;
+    if (priority > 0) link.datagramIdle = false;
+    if (priority > 1 && link.datagramQueuedBytes + len > (256 - 32) * 1024) {
+        link.stats.datagramsDropped++;
+        return;
+    }
+    link.datagramQueuedBytes += len;
+    link.datagramWriter.write(HEAPU8.slice(src, src + len)).then(
+        () => {
+            link.datagramQueuedBytes -= len;
+            link.stats.datagramsSent++;
+        },
+        () => {
+            link.datagramQueuedBytes -= len;
+            link.stats.datagramsDropped++;
+        },
+    );
 });
 
 EM_ASYNC_JS(void, _zp_webtransport_js_close, (int handle), {
@@ -449,6 +573,19 @@ size_t _z_webtransport_transport_write(const _z_webtransport_socket_t *sock, con
 
 size_t _z_webtransport_transport_read_socket(const _z_sys_net_socket_t socket, uint8_t *ptr, size_t len) {
     return _z_webtransport_read(socket, ptr, len);
+}
+
+uint16_t _z_webtransport_transport_datagram_mtu(const _z_webtransport_socket_t *sock) {
+    return (uint16_t)_zp_webtransport_js_datagram_mtu(sock->_sock._webtransport._handle);
+}
+
+bool _z_webtransport_transport_datagram_idle(const _z_webtransport_socket_t *sock) {
+    return _zp_webtransport_js_datagram_idle(sock->_sock._webtransport._handle) != 0;
+}
+
+void _z_webtransport_transport_write_datagram(const _z_webtransport_socket_t *sock, const uint8_t *ptr, size_t len,
+                                              uint8_t priority) {
+    _zp_webtransport_js_write_datagram(sock->_sock._webtransport._handle, ptr, len, priority);
 }
 #else
 typedef int _zp_webtransport_emscripten_transport_disabled_t;
