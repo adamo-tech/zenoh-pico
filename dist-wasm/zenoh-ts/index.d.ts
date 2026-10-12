@@ -54,14 +54,7 @@ export class PicoSession implements AsyncDisposable {
     put(keyExpr: string, payload: Uint8Array | ArrayBuffer, options?: PicoQosOptions): Promise<void>;
     delete(keyExpr: string, options?: PicoQosOptions): Promise<void>;
     get(keyExpr: string, options?: PicoGetOptions): Promise<PicoReceiver<PicoReply>>;
-    /** True while the current physical link carries best-effort traffic as WebTransport datagrams. */
     hasDatagramPath(): boolean;
-    /**
-     * One entry per physical link. Datagram counters: `datagramsSent`, `datagramsReceived`,
-     * `datagramsDropped` (refused for queue headroom, rejected by the browser, or received while the
-     * receive buffer was full) and `maxDatagramSize` (largest Zenoh batch sent as one datagram, 0 without
-     * a datagram path).
-     */
     diagnostics(): Array<Record<string, unknown>>;
     performanceDiagnostics(): {
         allocMs: number;

@@ -228,5 +228,14 @@ z_result_t _z_handle_network_message(_z_transport_common_t *transport, _z_zenoh_
             _z_n_msg_clear(msg);
             break;
     }
+    if (ret == _Z_ERR_KEYEXPR_UNKNOWN) {
+        // The wire expression references a key-expression id this side does not (or no longer) know,
+        // typically a message that was already in flight when the id was undeclared (e.g. a subscriber
+        // being closed while the router still pushes data encoded with its id). Routers drop such
+        // messages and keep the session; do the same instead of tearing down the whole transport.
+        // Every handler above releases the message on this error path.
+        _Z_WARN("Dropping network message (tag %d) with an unresolvable key expression", msg->_tag);
+        ret = _Z_RES_OK;
+    }
     return ret;
 }

@@ -81,26 +81,42 @@ static z_result_t _z_unicast_process_messages(_z_transport_unicast_t *ztu, _z_tr
 
 static bool _z_unicast_client_read(_z_transport_unicast_t *ztu, _z_transport_peer_unicast_t *peer, size_t *to_read) {
     switch (ztu->_common._link->_cap._flow) {
-        case Z_LINK_CAP_FLOW_STREAM:
-            if (_z_zbuf_len(&ztu->_common._zbuf) < _Z_MSG_LEN_ENC_SIZE) {
-                _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
-                if (_z_zbuf_len(&ztu->_common._zbuf) < _Z_MSG_LEN_ENC_SIZE) {
-                    _z_zbuf_compact(&ztu->_common._zbuf);
+        case Z_LINK_CAP_FLOW_STREAM: {
+            _z_zbuf_t *zbuf = &ztu->_common._zbuf;
+            if (_z_zbuf_len(zbuf) < _Z_MSG_LEN_ENC_SIZE) {
+                // Never issue a read into a buffer with no room left: move the partial
+                // length prefix to the front first so the read can make progress.
+                if (_z_zbuf_space_left(zbuf) < _Z_MSG_LEN_ENC_SIZE) {
+                    _z_zbuf_compact(zbuf);
+                }
+                _z_link_socket_recv_zbuf(ztu->_common._link, zbuf, peer->_socket);
+                if (_z_zbuf_len(zbuf) < _Z_MSG_LEN_ENC_SIZE) {
+                    _z_zbuf_compact(zbuf);
                     return false;
                 }
             }
             // Get stream size
-            *to_read = _z_read_stream_size(&ztu->_common._zbuf);
+            *to_read = _z_read_stream_size(zbuf);
             // Read data
-            if (_z_zbuf_len(&ztu->_common._zbuf) < *to_read) {
-                _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
-                if (_z_zbuf_len(&ztu->_common._zbuf) < *to_read) {
-                    _z_zbuf_set_rpos(&ztu->_common._zbuf, _z_zbuf_get_rpos(&ztu->_common._zbuf) - _Z_MSG_LEN_ENC_SIZE);
-                    _z_zbuf_compact(&ztu->_common._zbuf);
+            if (_z_zbuf_len(zbuf) < *to_read) {
+                size_t missing = *to_read - _z_zbuf_len(zbuf);
+                if (_z_zbuf_space_left(zbuf) < missing) {
+                    // The rest of this batch cannot fit behind the write position (the batch
+                    // straddles the end of the buffer). Compact before reading instead of
+                    // issuing a zero-length read and losing a whole read cycle.
+                    _z_zbuf_set_rpos(zbuf, _z_zbuf_get_rpos(zbuf) - _Z_MSG_LEN_ENC_SIZE);
+                    _z_zbuf_compact(zbuf);
+                    *to_read = _z_read_stream_size(zbuf);
+                }
+                _z_link_socket_recv_zbuf(ztu->_common._link, zbuf, peer->_socket);
+                if (_z_zbuf_len(zbuf) < *to_read) {
+                    _z_zbuf_set_rpos(zbuf, _z_zbuf_get_rpos(zbuf) - _Z_MSG_LEN_ENC_SIZE);
+                    _z_zbuf_compact(zbuf);
                     return false;
                 }
             }
             break;
+        }
         case Z_LINK_CAP_FLOW_DATAGRAM:
             _z_zbuf_compact(&ztu->_common._zbuf);
             *to_read = _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
