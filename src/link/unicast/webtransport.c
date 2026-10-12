@@ -1,11 +1,11 @@
-#include "zenoh-pico/config.h"
-
-#if Z_FEATURE_LINK_WEBTRANSPORT == 1
 #include <stdlib.h>
 
+#include "zenoh-pico/config.h"
 #include "zenoh-pico/link/config/webtransport.h"
 #include "zenoh-pico/link/manager.h"
 #include "zenoh-pico/link/transport/webtransport.h"
+
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
 
 z_result_t _z_endpoint_webtransport_valid(_z_endpoint_t *endpoint) {
     _z_string_t schema = _z_string_alias_str(WEBTRANSPORT_SCHEMA);
