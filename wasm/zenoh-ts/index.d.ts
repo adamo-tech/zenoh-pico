@@ -54,6 +54,7 @@ export class PicoSession implements AsyncDisposable {
     put(keyExpr: string, payload: Uint8Array | ArrayBuffer, options?: PicoQosOptions): Promise<void>;
     delete(keyExpr: string, options?: PicoQosOptions): Promise<void>;
     get(keyExpr: string, options?: PicoGetOptions): Promise<PicoReceiver<PicoReply>>;
+    hasDatagramPath(): boolean;
     diagnostics(): Array<Record<string, unknown>>;
     performanceDiagnostics(): {
         allocMs: number;

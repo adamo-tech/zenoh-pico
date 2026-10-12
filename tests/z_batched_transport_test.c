@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "zenoh-pico/protocol/codec/transport.h"
+#include "zenoh-pico/transport/common/tx.h"
 #include "zenoh-pico/transport/unicast/rx.h"
 
 #undef NDEBUG
@@ -55,8 +56,21 @@ static void test_invalid_network_message(uint8_t header) {
     _z_zbuf_clear(&buffer);
 }
 
+static void test_fragment_reliability(z_reliability_t reliability) {
+    _z_wbuf_t payload = _z_wbuf_make(16, false);
+    _z_wbuf_write(&payload, 0x1f);
+    _z_wbuf_t fragment = _z_wbuf_make(16, false);
+    assert(__unsafe_z_serialize_zenoh_fragment(&fragment, &payload, reliability, 1, true) == _Z_RES_OK);
+    uint8_t header = _z_wbuf_get_iosli(&fragment, 0)->_buf[0];
+    assert(_Z_HAS_FLAG(header, _Z_FLAG_T_FRAGMENT_R) == (reliability == Z_RELIABILITY_RELIABLE));
+    _z_wbuf_clear(&fragment);
+    _z_wbuf_clear(&payload);
+}
+
 int main(void) {
     test_frame_boundaries();
+    test_fragment_reliability(Z_RELIABILITY_RELIABLE);
+    test_fragment_reliability(Z_RELIABILITY_BEST_EFFORT);
     test_invalid_network_message(0x18);
     test_invalid_network_message(0x1f);
     return 0;

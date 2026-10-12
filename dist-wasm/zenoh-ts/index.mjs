@@ -243,6 +243,10 @@ export class PicoSession {
         ));
     }
 
+    hasDatagramPath() {
+        return !this.closed && this.runtime.module.hasZenohDatagramPath();
+    }
+
     diagnostics() {
         return this.runtime.module.getZenohTransportStats?.() ?? [];
     }

@@ -127,6 +127,71 @@ static z_result_t _z_transport_tx_send_fragment(_z_transport_common_t *ztc, cons
 }
 #endif
 
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
+static inline z_priority_t _z_transport_tx_get_priority(const _z_network_message_t *msg) {
+    switch (msg->_tag) {
+        case _Z_N_DECLARE:
+            return _z_n_qos_get_priority(msg->_body._declare._ext_qos);
+        case _Z_N_PUSH:
+            return _z_n_qos_get_priority(msg->_body._push._qos);
+        case _Z_N_REQUEST:
+            return _z_n_qos_get_priority(msg->_body._request._ext_qos);
+        case _Z_N_RESPONSE:
+            return _z_n_qos_get_priority(msg->_body._response._ext_qos);
+        default:
+            return Z_PRIORITY_DEFAULT;
+    }
+}
+
+static void _z_transport_tx_write_datagram(_z_transport_common_t *ztc, const _z_wbuf_t *datagram, uint8_t priority) {
+    _z_slice_t bytes = _z_iosli_to_bytes(_z_wbuf_get_iosli(datagram, 0));
+    _z_webtransport_transport_write_datagram(&ztc->_link->_socket._webtransport, bytes.start, bytes.len, priority);
+}
+
+static z_result_t _z_transport_tx_send_datagram(_z_transport_common_t *ztc, const _z_network_message_t *n_msg,
+                                                uint16_t mtu) {
+    uint8_t priority = (uint8_t)_z_transport_tx_get_priority(n_msg);
+    _z_wbuf_t datagram = _z_wbuf_make(mtu, false);
+    _z_zint_t sn = _z_transport_tx_get_sn(ztc, Z_RELIABILITY_BEST_EFFORT);
+    _z_transport_message_t t_msg = _z_t_msg_make_frame_header(sn, Z_RELIABILITY_BEST_EFFORT);
+    z_result_t ret = _z_transport_message_encode(&datagram, &t_msg);
+    if (ret == _Z_RES_OK && _z_network_message_encode(&datagram, n_msg) == _Z_RES_OK) {
+        _z_transport_tx_write_datagram(ztc, &datagram, priority);
+    } else if (ret == _Z_RES_OK) {
+        _z_wbuf_t fragments = _z_wbuf_make(_Z_FRAG_BUFF_BASE_SIZE, true);
+        ret = _z_network_message_encode(&fragments, n_msg);
+        bool is_first = true;
+        while (ret == _Z_RES_OK && _z_wbuf_len(&fragments) > 0) {
+            if (!is_first) {
+                sn = _z_transport_tx_get_sn(ztc, Z_RELIABILITY_BEST_EFFORT);
+            }
+            _z_wbuf_reset(&datagram);
+            ret = __unsafe_z_serialize_zenoh_fragment(&datagram, &fragments, Z_RELIABILITY_BEST_EFFORT, sn, is_first);
+            if (ret == _Z_RES_OK) {
+                _z_transport_tx_write_datagram(ztc, &datagram, priority);
+            }
+            is_first = false;
+        }
+        _z_wbuf_clear(&fragments);
+    }
+    _z_wbuf_clear(&datagram);
+    return ret;
+}
+
+void _z_transport_tx_send_datagram_keep_alive(_z_transport_common_t *ztc) {
+    if (ztc->_link->_type != _Z_LINK_TYPE_WEBTRANSPORT ||
+        !_z_webtransport_transport_datagram_idle(&ztc->_link->_socket._webtransport)) {
+        return;
+    }
+    _z_wbuf_t datagram = _z_wbuf_make(_Z_FRAG_BUFF_BASE_SIZE, false);
+    _z_transport_message_t t_msg = _z_t_msg_make_keep_alive();
+    if (_z_transport_message_encode(&datagram, &t_msg) == _Z_RES_OK) {
+        _z_transport_tx_write_datagram(ztc, &datagram, _Z_PRIORITY_CONTROL);
+    }
+    _z_wbuf_clear(&datagram);
+}
+#endif
+
 static inline bool _z_transport_tx_batch_has_data(_z_transport_common_t *ztc) {
 #if Z_FEATURE_BATCHING == 1
     return (ztc->_batch_state == _Z_BATCHING_ACTIVE) && (ztc->_batch_count > 0);
@@ -223,6 +288,14 @@ static inline size_t _z_transport_tx_save_wpos(_z_wbuf_t *wbuf) {
 static z_result_t _z_transport_tx_send_n_msg_inner(_z_transport_common_t *ztc, const _z_network_message_t *n_msg,
                                                    z_reliability_t reliability,
                                                    _z_transport_peer_unicast_slist_t *peers) {
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
+    if (reliability == Z_RELIABILITY_BEST_EFFORT && ztc->_link->_type == _Z_LINK_TYPE_WEBTRANSPORT) {
+        uint16_t mtu = _z_webtransport_transport_datagram_mtu(&ztc->_link->_socket._webtransport);
+        if (mtu > 0) {
+            return _z_transport_tx_send_datagram(ztc, n_msg, mtu);
+        }
+    }
+#endif
     // Init buffer
     _z_zint_t sn = 0;
     bool batch_has_data = _z_transport_tx_batch_has_data(ztc);
@@ -462,8 +535,7 @@ z_result_t __unsafe_z_serialize_zenoh_fragment(_z_wbuf_t *dst, _z_wbuf_t *src, z
     do {
         size_t w_pos = _z_wbuf_get_wpos(dst);  // Mark the buffer for the writing operation
 
-        _z_transport_message_t f_hdr =
-            _z_t_msg_make_fragment_header(sn, reliability == Z_RELIABILITY_RELIABLE, is_final, first, false);
+        _z_transport_message_t f_hdr = _z_t_msg_make_fragment_header(sn, reliability, is_final, first, false);
         ret = _z_transport_message_encode(dst, &f_hdr);  // Encode the frame header
         if (ret == _Z_RES_OK) {
             size_t space_left = _z_wbuf_space_left(dst);

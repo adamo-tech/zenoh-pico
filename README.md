@@ -74,6 +74,17 @@ matching over a `webtransport/host:port` locator. Browser WebTransport requires
 HTTPS and a trusted server certificate or a SHA-256 certificate hash supplied
 when opening the session.
 
+When the browser supports WebTransport datagrams, the link asks the router for
+mixed reliability by adding `mixed_rel=1` to the CONNECT URL. A router whose
+WebTransport listener has `mixed_rel=auto` accepts by opening a unidirectional
+stream carrying its datagram MTU as a little-endian `u16`. From then on
+best-effort messages travel as datagrams (one Zenoh batch per datagram, no
+length prefix, fragmented to the smaller of the router's and the browser's
+datagram size) and reliable messages stay on the bidirectional stream.
+`session.hasDatagramPath()` reports whether the current link has a datagram
+path, and `session.diagnostics()` counts datagrams sent, received and dropped.
+Without datagram support on either side, everything stays on the stream.
+
 ```js
 import {createZenohPico} from "./dist-wasm/zenoh-ts/index.mjs";
 

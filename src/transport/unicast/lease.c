@@ -188,6 +188,9 @@ _z_fut_fn_result_t _zp_unicast_keep_alive_task_fn(void *ztu_arg, _z_executor_t *
             }
         }
         ztu->_common._transmitted = false;
+#if Z_FEATURE_LINK_WEBTRANSPORT == 1
+        _z_transport_tx_send_datagram_keep_alive(&ztu->_common);
+#endif
         return _z_fut_fn_result_wake_up_after((unsigned long)ztu->_common._lease / Z_TRANSPORT_LEASE_EXPIRE_FACTOR);
     }
 // TODO: Should we have a task per peer ?

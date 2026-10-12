@@ -20,5 +20,9 @@ size_t _z_webtransport_transport_read(const _z_webtransport_socket_t *sock, uint
 size_t _z_webtransport_transport_read_exact(const _z_webtransport_socket_t *sock, uint8_t *ptr, size_t len);
 size_t _z_webtransport_transport_write(const _z_webtransport_socket_t *sock, const uint8_t *ptr, size_t len);
 size_t _z_webtransport_transport_read_socket(const _z_sys_net_socket_t socket, uint8_t *ptr, size_t len);
+uint16_t _z_webtransport_transport_datagram_mtu(const _z_webtransport_socket_t *sock);
+bool _z_webtransport_transport_datagram_idle(const _z_webtransport_socket_t *sock);
+void _z_webtransport_transport_write_datagram(const _z_webtransport_socket_t *sock, const uint8_t *ptr, size_t len,
+                                              uint8_t priority);
 #endif
 #endif
